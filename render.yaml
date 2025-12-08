@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: shop
+    env: node
+    plan: free
+    buildCommand: "npm install"
+    startCommand: "node server.js"
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: mydb
+          property: connectionString
+      - key: JWT_SECRET
+        value: "your_jwt_secret"
+      - key: CLOUDINARY_CLOUD_NAME
+        value: "your_cloud_name"
+      - key: CLOUDINARY_API_KEY
+        value: "your_api_key"
+      - key: CLOUDINARY_API_SECRET
+        value: "your_api_secret"
+
+databases:
+  - name: mydb
+    plan: free
