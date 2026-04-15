@@ -6,7 +6,7 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 
-<body style="font-family: Arial; background:#111; color:white;">
+<body style="font-family: Arial; background:#111; color:white; padding:20px;">
 
 <h1>光譜儀介面</h1>
 
@@ -16,29 +16,37 @@
 </div>
 
 <div>
+  <h2>圖片上傳</h2>
+  <input type="file" id="imageInput" accept="image/*">
+</div>
+
+<div style="margin-top: 20px;">
   <h2>控制</h2>
-  <button onclick="startMeasurement()">開始測量</button>
+  <button onclick="calibrateMercury()">汞燈校準</button>
+  <button onclick="measureSpectrum()">開始測量</button>
   <button onclick="stopMeasurement()">停止測量</button>
 </div>
 
-<div>
-  <h2>光譜圖</h2>
-  <canvas id="chart" width="800" height="400"></canvas>
+<div style="margin-top: 20px;">
+  <h2>校準資訊</h2>
+  <p id="calibration">尚未校準</p>
 </div>
 
-<div>
+<div style="margin-top: 20px;">
+  <h2>光譜圖</h2>
+  <canvas id="chart" width="900" height="400"></canvas>
+</div>
+
+<div style="margin-top: 20px;">
   <h3>分析結果</h3>
   <p id="peak">主峰波長：-- nm ｜ 強度：--</p>
 </div>
 
 <script>
-  const wavelengths = [];
+  let wavelengths = [];
   let intensities = [];
-
-  for (let i = 400; i <= 700; i += 5) {
-    wavelengths.push(i);
-    intensities.push(0);
-  }
+  let interval = null;
+  let calibrationReady = false;
 
   const ctx = document.getElementById('chart');
 
@@ -56,6 +64,7 @@
     },
     options: {
       animation: false,
+      responsive: false,
       scales: {
         x: {
           title: {
@@ -73,50 +82,85 @@
     }
   });
 
-  let interval = null;
+  function updateChart(spectrum) {
+    wavelengths = spectrum.map(p => p.wavelength);
+    intensities = spectrum.map(p => p.intensity);
 
-  function generateData() {
-    return wavelengths.map(i => {
-      return (
-        80 * Math.exp(-((i - 470) ** 2) / 800) +
-        120 * Math.exp(-((i - 550) ** 2) / 500) +
-        90 * Math.exp(-((i - 620) ** 2) / 900) +
-        Math.random() * 10
-      );
-    });
+    chart.data.labels = wavelengths;
+    chart.data.datasets[0].data = intensities;
+    chart.update();
   }
 
-  function findPeak() {
-    let max = -Infinity;
-    let index = 0;
-
-    for (let i = 0; i < intensities.length; i++) {
-      if (intensities[i] > max) {
-        max = intensities[i];
-        index = i;
-      }
+  async function calibrateMercury() {
+    const file = document.getElementById("imageInput").files[0];
+    if (!file) {
+      alert("請先上傳汞燈圖片");
+      return;
     }
 
-    const peakWavelength = wavelengths[index];
+    const formData = new FormData();
+    formData.append("image", file);
+
+    const res = await fetch("/calibrate", {
+      method: "POST",
+      body: formData
+    });
+
+    const data = await res.json();
+
+    if (data.error) {
+      alert(data.error);
+      return;
+    }
+
+    calibrationReady = true;
+    document.getElementById("calibration").innerText =
+      `校準完成：λ = ${data.coefficients.join(" , ")}`;
+
+    updateChart(data.spectrum);
 
     document.getElementById("peak").innerText =
-      `主峰波長：${peakWavelength} nm ｜ 強度：${max.toFixed(2)}`;
+      `校準峰示例：${data.detected_peaks_nm.join(", ")} nm`;
   }
 
-  function startMeasurement() {
-    if (interval) return;
+  async function measureSpectrum() {
+    if (!calibrationReady) {
+      alert("請先用汞燈校準");
+      return;
+    }
 
-    interval = setInterval(() => {
-      intensities = generateData();
-      chart.data.datasets[0].data = intensities;
-      chart.update();
-      findPeak();
-    }, 500);
+    const file = document.getElementById("imageInput").files[0];
+    if (!file) {
+      alert("請先上傳要分析的圖片");
+      return;
+    }
+
+    const formData = new FormData();
+    formData.append("image", file);
+
+    const res = await fetch("/analyze", {
+      method: "POST",
+      body: formData
+    });
+
+    const data = await res.json();
+
+    if (data.error) {
+      alert(data.error);
+      return;
+    }
+
+    updateChart(data.spectrum);
+
+    document.getElementById("peak").innerText =
+      `主峰波長：${data.peak_wavelength.toFixed(2)} nm ｜ 強度：${data.peak_intensity.toFixed(2)}`;
   }
 
   function stopMeasurement() {
-    clearInterval(interval);
-    interval = null;
+    if (interval) {
+      clearInterval(interval);
+      interval = null;
+    }
   }
 </script>
 
