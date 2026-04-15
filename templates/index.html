@@ -21,9 +21,9 @@
 
 <div style="margin-top: 12px;">
   <label>y1：</label>
-  <input type="number" id="y1" placeholder="例如 100">
+  <input type="number" id="y1" placeholder="留空自動抓">
   <label>y2：</label>
-  <input type="number" id="y2" placeholder="例如 200">
+  <input type="number" id="y2" placeholder="留空自動抓">
 </div>
 
 <div style="margin-top: 20px;">
@@ -33,7 +33,7 @@
 
 <div style="margin-top: 20px;">
   <h3>校準資訊</h3>
-  <p id="calibrationInfo">尚未校準</p>
+  <pre id="calibrationInfo" style="color:#fff;">尚未校準</pre>
 </div>
 
 <div style="margin-top: 20px;">
@@ -110,8 +110,9 @@
 
     const formData = new FormData();
     formData.append("image", file);
-    if (y1) formData.append("y1", y1);
-    if (y2) formData.append("y2", y2);
+
+    if (y1 !== "") formData.append("y1", y1);
+    if (y2 !== "") formData.append("y2", y2);
 
     return formData;
   }
@@ -142,10 +143,15 @@
     updateChartFromSpectrum(data.spectrum);
 
     document.getElementById("calibrationInfo").innerText =
-      `校準完成\n係數: ${data.coefficients.join(", ")}\n峰值 pixel: ${data.detected_peak_pixels.join(", ")}\n對應汞燈線: ${data.matched_mercury_lines.join(", ")}`;
+`校準完成
+自動/實際使用範圍: y1=${data.used_y1}, y2=${data.used_y2}
+係數: ${data.coefficients.join(", ")}
+峰值 pixel: ${data.detected_peak_pixels.join(", ")}
+對應汞燈線: ${data.matched_mercury_lines.join(", ")}
+校正後峰值: ${data.calibrated_peak_wavelengths.join(", ")}`;
 
     document.getElementById("peak").innerText =
-      `校準完成，可開始分析未知圖片`;
+      "校準完成，可開始分析未知圖片";
     document.getElementById("allPeaks").innerText = "";
   }
 
@@ -173,7 +179,7 @@
     updateChartFromSpectrum(data.spectrum);
 
     document.getElementById("peak").innerText =
-      `主峰波長：${data.peak_wavelength} nm ｜ 強度：${data.peak_intensity}`;
+      `主峰波長：${data.peak_wavelength} nm ｜ 強度：${data.peak_intensity} ｜ 使用範圍 y=${data.used_y1}~${data.used_y2}`;
 
     if (data.all_peaks && data.all_peaks.length > 0) {
       document.getElementById("allPeaks").innerText =
