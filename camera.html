@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>光譜儀拍照系統</title>
+    <style>
+        /* 頁面整體風格：深色工業風 */
+        body {
+            font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            background-color: #121212;
+            color: white;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+        }
+
+        h1 {
+            color: #00e676; /* 螢光綠，有科技感 */
+            margin-bottom: 10px;
+            text-shadow: 0 0 10px rgba(0,230,118,0.5);
+        }
+
+        /* 視訊預覽區域容器 */
+        .video-container {
+            position: relative;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            border-radius: 8px;
+            overflow: hidden;
+            border: 2px solid #333;
+            background-color: #000;
+        }
+
+        /* 即時視訊標籤 */
+        #video {
+            display: block;
+            /* 保持縱橫比，寬度最大化但限制高度 */
+            max-width: 100%;
+            height: auto;
+            max-height: 70vh; /* 限制高度在螢幕的 70%，避免按鈕跑出畫面 */
+            transform: scaleX(-1); /* 預設像鏡子一樣左右反轉，比較符合直覺，拍照時會轉回來 */
+        }
+
+        /* 控制區域 */
+        .controls {
+            margin-top: 25px;
+            text-align: center;
+        }
+
+        /* 拍照按鈕樣式 */
+        #snap {
+            background: linear-gradient(45deg, #ff1744, #d50000);
+            color: white;
+            font-size: 18px;
+            font-weight: bold;
+            padding: 15px 35px;
+            border: none;
+            border-radius: 50px;
+            cursor: pointer;
+            box-shadow: 0 4px 15px rgba(255, 23, 68, 0.4);
+            transition: all 0.2s ease;
+            outline: none;
+        }
+
+        #snap:hover {
+            box-shadow: 0 6px 20px rgba(255, 23, 68, 0.6);
+            transform: translateY(-2px);
+        }
+
+        #snap:active {
+            transform: translateY(1px);
+            box-shadow: 0 2px 10px rgba(255, 23, 68, 0.4);
+        }
+        
+        #snap:disabled {
+            background: #555;
+            cursor: not-allowed;
+            box-shadow: none;
+        }
+
+        /* 狀態提示 */
+        #status {
+            margin-top: 15px;
+            font-size: 14px;
+            color: #aaa;
+        }
+
+        /* 用於拍照的隱藏 canvas */
+        #captureCanvas {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>光譜儀影像擷取</h1>
+
+    <div class="video-container">
+        <video id="video" autoplay playsinline>攝像頭畫面載入中...</video>
+    </div>
+
+    <div class="controls">
+        <button id="snap" disabled>📸 拍照並存到電腦</button>
+        <div id="status">正在請求攝像頭權限...</div>
+    </div>
+
+    <canvas id="captureCanvas"></canvas>
+
+    <script>
+        const video = document.getElementById('video');
+        const snapBtn = document.getElementById('snap');
+        const canvas = document.getElementById('captureCanvas');
+        const statusText = document.getElementById('status');
+
+        // 1. 初始化攝像頭
+        async function initCamera() {
+            try {
+                // 請求高解析度視訊
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { 
+                        width: { ideal: 1920 }, // 嘗試請求 Full HD
+                        height: { ideal: 1080 },
+                        facingMode: "environment" // 對於光譜儀，優先使用後鏡頭(如果有的話)
+                    }, 
+                    audio: false // 不需要聲音
+                });
+                
+                // 將視訊流對接到 video 標籤
+                video.srcObject = stream;
+                
+                // 當視訊元數據載入完成後 (得知實際解析度)
+                video.onloadedmetadata = () => {
+                    statusText.innerText = `攝像頭已連線 (解析度: ${video.videoWidth}x${video.videoHeight})`;
+                    snapBtn.disabled = false; // 啟用按鈕
+                };
+
+            } catch (err) {
+                console.error("攝像頭開啟失敗: ", err);
+                statusText.innerText = "失敗: 無法開啟攝像頭，請檢查權限及連線。";
+                statusText.style.color = "#ff5252";
+            }
+        }
+
+        // 2. 拍照與下載邏輯
+        snapBtn.addEventListener('click', () => {
+            if (!video.srcObject) return;
+
+            const context = canvas.getContext('2d');
+            
+            // 根據影片實際解析度設定畫布大小
+            const w = video.videoWidth;
+            const h = video.videoHeight;
+            canvas.width = w;
+            canvas.height = h;
+            
+            // --- 圖片處理 ---
+            // 因為預覽時為了符合直覺用了鏡像(scaleX(-1))，拍照時要轉回來正常的樣子
+            context.save(); // 保存當前狀態
+            context.translate(w, 0); // 移動原點到右上角
+            context.scale(-1, 1); // 左右反轉畫布
+            
+            // 將 video 畫面繪製到 canvas 上
+            context.drawImage(video, 0, 0, w, h);
+            
+            context.restore(); // 恢復狀態
+
+            // 3. 觸發下載
+            // 將 canvas 轉為 Base64 編碼的 JPEG 圖片 (品質 0.9)
+            const imageDataUrl = canvas.toDataURL("image/jpeg", 0.9);
+            
+            // 建立一個隱藏的超連結用於下載
+            const downloadLink = document.createElement('a');
+            
+            // 設定檔名，加入時間戳記避免重複
+            const timestamp = new Date().toISOString().slice(0,19).replace(/:/g, '-');
+            downloadLink.download = `spectrum_snap_${timestamp}.jpg`;
+            
+            // 將圖片數據賦值給連結
+            downloadLink.href = imageDataUrl;
+            
+            // 模擬點擊連結，觸發瀏覽器下載行為
+            downloadLink.click();
+            
+            // 視覺回饋：閃爍一下 video container 表示拍照
+            video.style.opacity = '0.5';
+            setTimeout(() => video.style.opacity = '1', 100);
+            
+            console.log("照片已產生並下載");
+        });
+
+        // 頁面載入後自動啟動攝像頭
+        window.addEventListener('load', initCamera);
+    </script>
+</body>
+</html>
