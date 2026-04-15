@@ -5,12 +5,24 @@ import numpy as np
 
 app = Flask(__name__)
 
-def pixel_to_wavelength(x, width, wl_min, wl_max):
-    if width <= 1:
-        return wl_min
-    return wl_min + (x / (width - 1)) * (wl_max - wl_min)
+# 全域保存校正參數
+calibration_coeffs = None
 
-def analyze_spectrum(image, wl_min=400, wl_max=700, y1=None, y2=None):
+# 常見汞燈可見光譜線（nm）
+MERCURY_LINES = np.array([
+    404.656,
+    435.833,
+    546.074,
+    576.960,
+    579.066
+], dtype=float)
+
+
+def extract_spectrum(image, y1=None, y2=None):
+    """
+    從圖片擷取一維光譜：
+    對 ROI 灰階後，沿 y 方向加總，得到每個 x 的強度
+    """
     height, width = image.shape[:2]
 
     if y1 is None:
@@ -18,52 +30,96 @@ def analyze_spectrum(image, wl_min=400, wl_max=700, y1=None, y2=None):
     if y2 is None:
         y2 = height
 
-    y1 = max(0, y1)
-    y2 = min(height, y2)
+    y1 = max(0, int(y1))
+    y2 = min(height, int(y2))
 
     if y1 >= y2:
         raise ValueError("無效的分析範圍")
 
     roi = image[y1:y2, :]
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    intensity = np.sum(gray, axis=0).astype(float)
 
-    peak_x = int(np.argmax(intensity))
-    peak_intensity = float(intensity[peak_x])
-    peak_wavelength = float(pixel_to_wavelength(peak_x, width, wl_min, wl_max))
+    intensity = np.sum(gray, axis=0).astype(np.float64)
 
-    spectrum_data = []
-    for x in range(width):
-        wavelength = pixel_to_wavelength(x, width, wl_min, wl_max)
-        spectrum_data.append({
-            "x": x,
-            "wavelength": round(float(wavelength), 2),
-            "intensity": float(intensity[x])
-        })
+    # 背景扣除
+    intensity -= np.min(intensity)
+    intensity[intensity < 0] = 0
 
-    return {
-        "peak_x": peak_x,
-        "peak_wavelength": round(peak_wavelength, 2),
-        "peak_intensity": round(peak_intensity, 2),
-        "spectrum": spectrum_data
-    }
+    # 簡單平滑
+    kernel = np.ones(7) / 7
+    intensity = np.convolve(intensity, kernel, mode="same")
+
+    return intensity
+
+
+def detect_peaks_simple(intensity, min_distance=20, threshold_ratio=0.12):
+    """
+    簡易峰值偵測，不用 scipy
+    """
+    if len(intensity) < 3:
+        return np.array([], dtype=int)
+
+    threshold = np.max(intensity) * threshold_ratio
+    candidates = []
+
+    for i in range(1, len(intensity) - 1):
+        if intensity[i] > intensity[i - 1] and intensity[i] >= intensity[i + 1]:
+            if intensity[i] >= threshold:
+                candidates.append(i)
+
+    if not candidates:
+        return np.array([], dtype=int)
+
+    # 合併太近的峰，只保留較高者
+    filtered = []
+    for idx in candidates:
+        if not filtered:
+            filtered.append(idx)
+        else:
+            if idx - filtered[-1] < min_distance:
+                if intensity[idx] > intensity[filtered[-1]]:
+                    filtered[-1] = idx
+            else:
+                filtered.append(idx)
+
+    return np.array(filtered, dtype=int)
+
+
+def build_calibration(pixel_peaks, known_lines):
+    """
+    用峰值 pixel 與已知波長建立校正
+    點數 >= 3 用二次，多一點會更穩；否則用一次
+    """
+    n = min(len(pixel_peaks), len(known_lines))
+    if n < 2:
+        raise ValueError("校正至少需要 2 個峰")
+
+    x = np.array(pixel_peaks[:n], dtype=float)
+    y = np.array(known_lines[:n], dtype=float)
+
+    # 2點做一次；3點以上做二次
+    degree = 1 if n < 3 else 2
+    coeffs = np.polyfit(x, y, degree)
+    return coeffs
+
+
+def apply_calibration(x, coeffs):
+    return np.polyval(coeffs, x)
+
 
 @app.route("/")
 def home():
     return render_template("index.html")
 
-@app.route("/analyze", methods=["POST"])
-def analyze():
+
+@app.route("/calibrate", methods=["POST"])
+def calibrate():
+    global calibration_coeffs
+
     if "image" not in request.files:
-        return jsonify({"error": "沒有上傳圖片"}), 400
+        return jsonify({"error": "沒有上傳汞燈圖片"}), 400
 
     file = request.files["image"]
-
-    try:
-        wl_min = float(request.form.get("wl_min", 400))
-        wl_max = float(request.form.get("wl_max", 700))
-    except ValueError:
-        return jsonify({"error": "波長範圍格式錯誤"}), 400
 
     y1 = request.form.get("y1")
     y2 = request.form.get("y2")
@@ -81,13 +137,120 @@ def analyze():
         return jsonify({"error": "圖片讀取失敗"}), 400
 
     try:
-        result = analyze_spectrum(image, wl_min=wl_min, wl_max=wl_max, y1=y1, y2=y2)
+        intensity = extract_spectrum(image, y1=y1, y2=y2)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
-    except Exception:
-        return jsonify({"error": "分析失敗"}), 500
 
-    return jsonify(result)
+    peaks = detect_peaks_simple(intensity, min_distance=20, threshold_ratio=0.12)
+
+    if len(peaks) < 2:
+        return jsonify({"error": "偵測到的峰太少，無法校正"}), 400
+
+    # 取最亮的幾個峰
+    peak_strengths = intensity[peaks]
+    sorted_idx = np.argsort(peak_strengths)[::-1]
+    peaks = peaks[sorted_idx]
+
+    # 最多取和汞燈已知線數量一樣多的峰
+    use_n = min(len(peaks), len(MERCURY_LINES))
+    selected_peaks = np.sort(peaks[:use_n])
+
+    # 依序對應到已知汞燈線
+    # 注意：這是假設你的圖是由短波到長波依序排列
+    known_lines = MERCURY_LINES[:use_n]
+
+    try:
+        calibration_coeffs = build_calibration(selected_peaks, known_lines)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    x_all = np.arange(len(intensity), dtype=float)
+    wavelength_all = apply_calibration(x_all, calibration_coeffs)
+
+    spectrum_data = []
+    for x, wl, inten in zip(x_all, wavelength_all, intensity):
+        spectrum_data.append({
+            "x": int(x),
+            "wavelength": round(float(wl), 3),
+            "intensity": round(float(inten), 3)
+        })
+
+    calibrated_peak_wavelengths = apply_calibration(selected_peaks, calibration_coeffs)
+
+    return jsonify({
+        "message": "校準完成",
+        "coefficients": [float(c) for c in calibration_coeffs],
+        "detected_peak_pixels": [int(p) for p in selected_peaks],
+        "matched_mercury_lines": [float(v) for v in known_lines],
+        "calibrated_peak_wavelengths": [round(float(v), 3) for v in calibrated_peak_wavelengths],
+        "spectrum": spectrum_data
+    })
+
+
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    global calibration_coeffs
+
+    if calibration_coeffs is None:
+        return jsonify({"error": "尚未校準，請先上傳汞燈圖片做校準"}), 400
+
+    if "image" not in request.files:
+        return jsonify({"error": "沒有上傳圖片"}), 400
+
+    file = request.files["image"]
+
+    y1 = request.form.get("y1")
+    y2 = request.form.get("y2")
+
+    try:
+        y1 = int(y1) if y1 not in (None, "") else None
+        y2 = int(y2) if y2 not in (None, "") else None
+    except ValueError:
+        return jsonify({"error": "y1 或 y2 格式錯誤"}), 400
+
+    file_bytes = np.frombuffer(file.read(), np.uint8)
+    image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+    if image is None:
+        return jsonify({"error": "圖片讀取失敗"}), 400
+
+    try:
+        intensity = extract_spectrum(image, y1=y1, y2=y2)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    peak_x = int(np.argmax(intensity))
+    peak_intensity = float(intensity[peak_x])
+    peak_wavelength = float(apply_calibration(np.array([peak_x], dtype=float), calibration_coeffs)[0])
+
+    x_all = np.arange(len(intensity), dtype=float)
+    wavelength_all = apply_calibration(x_all, calibration_coeffs)
+
+    spectrum_data = []
+    for x, wl, inten in zip(x_all, wavelength_all, intensity):
+        spectrum_data.append({
+            "x": int(x),
+            "wavelength": round(float(wl), 3),
+            "intensity": round(float(inten), 3)
+        })
+
+    peaks = detect_peaks_simple(intensity, min_distance=20, threshold_ratio=0.12)
+    multi_peaks = []
+    for p in peaks:
+        multi_peaks.append({
+            "x": int(p),
+            "wavelength": round(float(apply_calibration(np.array([p]), calibration_coeffs)[0]), 3),
+            "intensity": round(float(intensity[p]), 3)
+        })
+
+    return jsonify({
+        "peak_x": peak_x,
+        "peak_wavelength": round(peak_wavelength, 3),
+        "peak_intensity": round(peak_intensity, 3),
+        "all_peaks": multi_peaks,
+        "spectrum": spectrum_data
+    })
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
