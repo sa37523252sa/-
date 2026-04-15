@@ -18,17 +18,44 @@ MERCURY_LINES = np.array([
 ], dtype=float)
 
 
+def auto_find_y_range(image, band_half_height=20):
+    """
+    自動找光譜帶的 y 範圍
+    做法：對每一列的亮度加總，找最亮那一列當中心
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # 每一列亮度總和
+    row_sum = np.sum(gray, axis=1).astype(np.float64)
+
+    # 平滑，避免雜訊影響
+    kernel = np.ones(15) / 15
+    row_sum = np.convolve(row_sum, kernel, mode="same")
+
+    center_y = int(np.argmax(row_sum))
+
+    height = image.shape[0]
+    y1 = max(0, center_y - band_half_height)
+    y2 = min(height, center_y + band_half_height)
+
+    return y1, y2
+
+
 def extract_spectrum(image, y1=None, y2=None):
     """
     從圖片擷取一維光譜：
     對 ROI 灰階後，沿 y 方向加總，得到每個 x 的強度
+    若 y1/y2 沒給，則自動找光譜帶
     """
     height, width = image.shape[:2]
 
-    if y1 is None:
-        y1 = 0
-    if y2 is None:
-        y2 = height
+    # 沒填就自動找
+    if y1 is None or y2 is None:
+        auto_y1, auto_y2 = auto_find_y_range(image, band_half_height=20)
+        if y1 is None:
+            y1 = auto_y1
+        if y2 is None:
+            y2 = auto_y2
 
     y1 = max(0, int(y1))
     y2 = min(height, int(y2))
@@ -39,22 +66,23 @@ def extract_spectrum(image, y1=None, y2=None):
     roi = image[y1:y2, :]
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
+    # 對每個 x 欄位做亮度總和
     intensity = np.sum(gray, axis=0).astype(np.float64)
 
     # 背景扣除
     intensity -= np.min(intensity)
     intensity[intensity < 0] = 0
 
-    # 簡單平滑
+    # 平滑
     kernel = np.ones(7) / 7
     intensity = np.convolve(intensity, kernel, mode="same")
 
-    return intensity
+    return intensity, y1, y2
 
 
 def detect_peaks_simple(intensity, min_distance=20, threshold_ratio=0.12):
     """
-    簡易峰值偵測，不用 scipy
+    簡單峰值偵測，不依賴 scipy
     """
     if len(intensity) < 3:
         return np.array([], dtype=int)
@@ -70,7 +98,7 @@ def detect_peaks_simple(intensity, min_distance=20, threshold_ratio=0.12):
     if not candidates:
         return np.array([], dtype=int)
 
-    # 合併太近的峰，只保留較高者
+    # 合併距離太近的峰，只保留較高的
     filtered = []
     for idx in candidates:
         if not filtered:
@@ -88,7 +116,7 @@ def detect_peaks_simple(intensity, min_distance=20, threshold_ratio=0.12):
 def build_calibration(pixel_peaks, known_lines):
     """
     用峰值 pixel 與已知波長建立校正
-    點數 >= 3 用二次，多一點會更穩；否則用一次
+    2點用一次，3點以上用二次
     """
     n = min(len(pixel_peaks), len(known_lines))
     if n < 2:
@@ -97,7 +125,6 @@ def build_calibration(pixel_peaks, known_lines):
     x = np.array(pixel_peaks[:n], dtype=float)
     y = np.array(known_lines[:n], dtype=float)
 
-    # 2點做一次；3點以上做二次
     degree = 1 if n < 3 else 2
     coeffs = np.polyfit(x, y, degree)
     return coeffs
@@ -137,7 +164,7 @@ def calibrate():
         return jsonify({"error": "圖片讀取失敗"}), 400
 
     try:
-        intensity = extract_spectrum(image, y1=y1, y2=y2)
+        intensity, used_y1, used_y2 = extract_spectrum(image, y1=y1, y2=y2)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
@@ -151,12 +178,10 @@ def calibrate():
     sorted_idx = np.argsort(peak_strengths)[::-1]
     peaks = peaks[sorted_idx]
 
-    # 最多取和汞燈已知線數量一樣多的峰
     use_n = min(len(peaks), len(MERCURY_LINES))
     selected_peaks = np.sort(peaks[:use_n])
 
-    # 依序對應到已知汞燈線
-    # 注意：這是假設你的圖是由短波到長波依序排列
+    # 假設由左到右是短波到長波
     known_lines = MERCURY_LINES[:use_n]
 
     try:
@@ -179,6 +204,8 @@ def calibrate():
 
     return jsonify({
         "message": "校準完成",
+        "used_y1": int(used_y1),
+        "used_y2": int(used_y2),
         "coefficients": [float(c) for c in calibration_coeffs],
         "detected_peak_pixels": [int(p) for p in selected_peaks],
         "matched_mercury_lines": [float(v) for v in known_lines],
@@ -215,7 +242,7 @@ def analyze():
         return jsonify({"error": "圖片讀取失敗"}), 400
 
     try:
-        intensity = extract_spectrum(image, y1=y1, y2=y2)
+        intensity, used_y1, used_y2 = extract_spectrum(image, y1=y1, y2=y2)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
@@ -239,11 +266,13 @@ def analyze():
     for p in peaks:
         multi_peaks.append({
             "x": int(p),
-            "wavelength": round(float(apply_calibration(np.array([p]), calibration_coeffs)[0]), 3),
+            "wavelength": round(float(apply_calibration(np.array([p], dtype=float), calibration_coeffs)[0]), 3),
             "intensity": round(float(intensity[p]), 3)
         })
 
     return jsonify({
+        "used_y1": int(used_y1),
+        "used_y2": int(used_y2),
         "peak_x": peak_x,
         "peak_wavelength": round(peak_wavelength, 3),
         "peak_intensity": round(peak_intensity, 3),
