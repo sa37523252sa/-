@@ -1,3 +1,4 @@
+import os
 from flask import Flask, request, jsonify, render_template
 import cv2
 import numpy as np
@@ -5,18 +6,11 @@ import numpy as np
 app = Flask(__name__)
 
 def pixel_to_wavelength(x, width, wl_min, wl_max):
-    """把 x 像素位置轉成波長"""
     if width <= 1:
         return wl_min
     return wl_min + (x / (width - 1)) * (wl_max - wl_min)
 
 def analyze_spectrum(image, wl_min=400, wl_max=700, y1=None, y2=None):
-    """
-    分析光譜圖片
-    image: OpenCV 讀進來的 BGR 圖
-    wl_min, wl_max: 左右邊界波長
-    y1, y2: 要分析的縱向範圍，若不給就抓整張
-    """
     height, width = image.shape[:2]
 
     if y1 is None:
@@ -31,10 +25,7 @@ def analyze_spectrum(image, wl_min=400, wl_max=700, y1=None, y2=None):
         raise ValueError("無效的分析範圍")
 
     roi = image[y1:y2, :]
-
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-
-    # 每個 x 欄位做亮度總和，得到一維光譜
     intensity = np.sum(gray, axis=0).astype(float)
 
     peak_x = int(np.argmax(intensity))
@@ -99,4 +90,5 @@ def analyze():
     return jsonify(result)
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
