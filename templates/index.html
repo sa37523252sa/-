@@ -1,11 +1,10 @@
 <!DOCTYPE html>
 <html lang="zh">
 <head>
-  <meta charset="UTF-8">
+  <meta charset="UTF-8" />
   <title>光譜儀 UI</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
-
 <body style="font-family: Arial; background:#111; color:white; padding:20px;">
 
 <h1>光譜儀介面</h1>
@@ -16,20 +15,25 @@
 </div>
 
 <div>
-  <h2>圖片上傳</h2>
+  <h2>上傳圖片</h2>
   <input type="file" id="imageInput" accept="image/*">
 </div>
 
-<div style="margin-top: 20px;">
-  <h2>控制</h2>
-  <button onclick="calibrateMercury()">汞燈校準</button>
-  <button onclick="measureSpectrum()">開始測量</button>
-  <button onclick="stopMeasurement()">停止測量</button>
+<div style="margin-top: 12px;">
+  <label>y1：</label>
+  <input type="number" id="y1" placeholder="例如 100">
+  <label>y2：</label>
+  <input type="number" id="y2" placeholder="例如 200">
 </div>
 
 <div style="margin-top: 20px;">
-  <h2>校準資訊</h2>
-  <p id="calibration">尚未校準</p>
+  <button onclick="calibrateMercury()">汞燈校準</button>
+  <button onclick="analyzeSpectrum()">分析圖片</button>
+</div>
+
+<div style="margin-top: 20px;">
+  <h3>校準資訊</h3>
+  <p id="calibrationInfo">尚未校準</p>
 </div>
 
 <div style="margin-top: 20px;">
@@ -42,64 +46,85 @@
   <p id="peak">主峰波長：-- nm ｜ 強度：--</p>
 </div>
 
+<div style="margin-top: 20px;">
+  <h3>所有峰值</h3>
+  <pre id="allPeaks" style="color:#7fffd4;"></pre>
+</div>
+
 <script>
-  let wavelengths = [];
-  let intensities = [];
-  let interval = null;
-  let calibrationReady = false;
+  let chart;
+  let calibrated = false;
 
-  const ctx = document.getElementById('chart');
+  function createChart(labels = [], data = []) {
+    const ctx = document.getElementById("chart").getContext("2d");
 
-  const chart = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels: wavelengths,
-      datasets: [{
-        label: 'Intensity',
-        data: intensities,
-        borderColor: 'cyan',
-        borderWidth: 2,
-        fill: false
-      }]
-    },
-    options: {
-      animation: false,
-      responsive: false,
-      scales: {
-        x: {
-          title: {
-            display: true,
-            text: '波長 (nm)'
-          }
-        },
-        y: {
-          title: {
-            display: true,
-            text: '強度'
+    if (chart) {
+      chart.destroy();
+    }
+
+    chart = new Chart(ctx, {
+      type: "line",
+      data: {
+        labels: labels,
+        datasets: [{
+          label: "Intensity",
+          data: data,
+          borderColor: "cyan",
+          borderWidth: 2,
+          fill: false,
+          pointRadius: 0
+        }]
+      },
+      options: {
+        animation: false,
+        responsive: false,
+        scales: {
+          x: {
+            title: {
+              display: true,
+              text: "波長 (nm)"
+            }
+          },
+          y: {
+            title: {
+              display: true,
+              text: "強度"
+            }
           }
         }
       }
-    }
-  });
-
-  function updateChart(spectrum) {
-    wavelengths = spectrum.map(p => p.wavelength);
-    intensities = spectrum.map(p => p.intensity);
-
-    chart.data.labels = wavelengths;
-    chart.data.datasets[0].data = intensities;
-    chart.update();
+    });
   }
 
-  async function calibrateMercury() {
+  createChart();
+
+  function getFormData() {
     const file = document.getElementById("imageInput").files[0];
+    const y1 = document.getElementById("y1").value;
+    const y2 = document.getElementById("y2").value;
+
     if (!file) {
-      alert("請先上傳汞燈圖片");
-      return;
+      alert("請先選擇圖片");
+      return null;
     }
 
     const formData = new FormData();
     formData.append("image", file);
+    if (y1) formData.append("y1", y1);
+    if (y2) formData.append("y2", y2);
+
+    return formData;
+  }
+
+  function updateChartFromSpectrum(spectrum) {
+    const labels = spectrum.map(p => p.wavelength);
+    const data = spectrum.map(p => p.intensity);
+    createChart(labels, data);
+  }
+
+  async function calibrateMercury() {
+    const formData = getFormData();
+    if (!formData) return;
 
     const res = await fetch("/calibrate", {
       method: "POST",
@@ -113,30 +138,25 @@
       return;
     }
 
-    calibrationReady = true;
-    document.getElementById("calibration").innerText =
-      `校準完成：λ = ${data.coefficients.join(" , ")}`;
+    calibrated = true;
+    updateChartFromSpectrum(data.spectrum);
 
-    updateChart(data.spectrum);
+    document.getElementById("calibrationInfo").innerText =
+      `校準完成\n係數: ${data.coefficients.join(", ")}\n峰值 pixel: ${data.detected_peak_pixels.join(", ")}\n對應汞燈線: ${data.matched_mercury_lines.join(", ")}`;
 
     document.getElementById("peak").innerText =
-      `校準峰示例：${data.detected_peaks_nm.join(", ")} nm`;
+      `校準完成，可開始分析未知圖片`;
+    document.getElementById("allPeaks").innerText = "";
   }
 
-  async function measureSpectrum() {
-    if (!calibrationReady) {
-      alert("請先用汞燈校準");
+  async function analyzeSpectrum() {
+    if (!calibrated) {
+      alert("請先做汞燈校準");
       return;
     }
 
-    const file = document.getElementById("imageInput").files[0];
-    if (!file) {
-      alert("請先上傳要分析的圖片");
-      return;
-    }
-
-    const formData = new FormData();
-    formData.append("image", file);
+    const formData = getFormData();
+    if (!formData) return;
 
     const res = await fetch("/analyze", {
       method: "POST",
@@ -150,16 +170,18 @@
       return;
     }
 
-    updateChart(data.spectrum);
+    updateChartFromSpectrum(data.spectrum);
 
     document.getElementById("peak").innerText =
-      `主峰波長：${data.peak_wavelength.toFixed(2)} nm ｜ 強度：${data.peak_intensity.toFixed(2)}`;
-  }
+      `主峰波長：${data.peak_wavelength} nm ｜ 強度：${data.peak_intensity}`;
 
-  function stopMeasurement() {
-    if (interval) {
-      clearInterval(interval);
-      interval = null;
+    if (data.all_peaks && data.all_peaks.length > 0) {
+      document.getElementById("allPeaks").innerText =
+        data.all_peaks.map(p =>
+          `x=${p.x}, λ=${p.wavelength} nm, intensity=${p.intensity}`
+        ).join("\n");
+    } else {
+      document.getElementById("allPeaks").innerText = "沒有偵測到其他峰值";
     }
   }
 </script>
