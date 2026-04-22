@@ -1,12 +1,21 @@
-import os
+from pathlib import Path
+
+code = r'''import os
+import io
+import csv
+import json
 from flask import Flask, request, jsonify, render_template
 import cv2
 import numpy as np
 
 app = Flask(__name__)
 
-# 全域保存校正參數
+# =========================
+# 全域保存校正與儀器設定
+# =========================
 calibration_coeffs = None
+calibration_meta = {}
+response_curve_data = None  # {"wavelength": np.array, "response": np.array}
 
 # 常見汞燈可見光譜線（nm）
 MERCURY_LINES = np.array([
@@ -18,38 +27,91 @@ MERCURY_LINES = np.array([
 ], dtype=float)
 
 
+# =========================
+# 基本工具
+# =========================
+def parse_optional_int(value):
+    if value in (None, ""):
+        return None
+    return int(value)
+
+
+def parse_optional_float(value, default=None):
+    if value in (None, ""):
+        return default
+    return float(value)
+
+
+def safe_odd_kernel_size(n, fallback=7):
+    n = int(n)
+    if n < 1:
+        return fallback
+    if n % 2 == 0:
+        n += 1
+    return n
+
+
+def moving_average(y, kernel_size=7):
+    kernel_size = safe_odd_kernel_size(kernel_size)
+    kernel = np.ones(kernel_size, dtype=float) / kernel_size
+    return np.convolve(y, kernel, mode="same")
+
+
+def normalize_positive(y):
+    y = np.asarray(y, dtype=np.float64)
+    y = y - np.min(y)
+    y[y < 0] = 0
+    return y
+
+
+def interpolate_response(wavelengths, response_wl, response_val):
+    """
+    將 response(λ) 插值到 wavelengths
+    超出範圍的地方用邊界值
+    """
+    return np.interp(
+        wavelengths,
+        response_wl,
+        response_val,
+        left=response_val[0],
+        right=response_val[-1]
+    )
+
+
+# =========================
+# 影像與光譜處理
+# =========================
+def decode_uploaded_image(file_storage):
+    file_bytes = np.frombuffer(file_storage.read(), np.uint8)
+    image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    return image
+
+
 def auto_find_y_range(image, band_half_height=20):
     """
-    自動找光譜帶的 y 範圍
-    做法：對每一列的亮度加總，找最亮那一列當中心
+    自動找光譜帶的 y 範圍：
+    對每一列亮度加總，找最亮列當中心
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-    # 每一列亮度總和
     row_sum = np.sum(gray, axis=1).astype(np.float64)
-
-    # 平滑，避免雜訊影響
-    kernel = np.ones(15) / 15
-    row_sum = np.convolve(row_sum, kernel, mode="same")
+    row_sum = moving_average(row_sum, kernel_size=15)
 
     center_y = int(np.argmax(row_sum))
-
     height = image.shape[0]
+
     y1 = max(0, center_y - band_half_height)
     y2 = min(height, center_y + band_half_height)
 
     return y1, y2
 
 
-def extract_spectrum(image, y1=None, y2=None):
+def extract_raw_signal(image, y1=None, y2=None):
     """
-    從圖片擷取一維光譜：
-    對 ROI 灰階後，沿 y 方向加總，得到每個 x 的強度
-    若 y1/y2 沒給，則自動找光譜帶
+    從圖片擷取一維原始訊號：
+    對 ROI 灰階後，沿 y 方向加總
     """
     height, width = image.shape[:2]
 
-    # 沒填就自動找
     if y1 is None or y2 is None:
         auto_y1, auto_y2 = auto_find_y_range(image, band_half_height=20)
         if y1 is None:
@@ -65,29 +127,127 @@ def extract_spectrum(image, y1=None, y2=None):
 
     roi = image[y1:y2, :]
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    signal = np.sum(gray, axis=0).astype(np.float64)
 
-    # 對每個 x 欄位做亮度總和
-    intensity = np.sum(gray, axis=0).astype(np.float64)
+    return signal, y1, y2
 
-    # 背景扣除
-    intensity -= np.min(intensity)
+
+def preprocess_intensity(
+    signal,
+    dark_signal=None,
+    integration_time_ms=1.0,
+    smooth_kernel=7
+):
+    """
+    物理上較合理的強度處理：
+    I_basic = (Signal - Dark) / IntegrationTime
+    """
+    signal = np.asarray(signal, dtype=np.float64)
+
+    if dark_signal is None:
+        corrected = signal.copy()
+    else:
+        dark_signal = np.asarray(dark_signal, dtype=np.float64)
+        if dark_signal.shape != signal.shape:
+            raise ValueError("dark signal 長度與主訊號不一致")
+        corrected = signal - dark_signal
+
+    corrected[corrected < 0] = 0
+
+    if integration_time_ms is None or integration_time_ms <= 0:
+        integration_time_ms = 1.0
+
+    intensity = corrected / float(integration_time_ms)
+
+    # 基線扣除：避免整條背景墊高
+    baseline = np.min(intensity)
+    intensity = intensity - baseline
     intensity[intensity < 0] = 0
 
     # 平滑
-    kernel = np.ones(7) / 7
-    intensity = np.convolve(intensity, kernel, mode="same")
+    intensity = moving_average(intensity, kernel_size=smooth_kernel)
 
-    return intensity, y1, y2
+    return intensity
+
+
+def load_response_curve_from_file(file_storage):
+    """
+    支援 CSV / TXT，格式範例：
+    wavelength,response
+    400,0.81
+    401,0.82
+    """
+    content = file_storage.read().decode("utf-8-sig")
+    reader = csv.reader(io.StringIO(content))
+
+    wavelength = []
+    response = []
+
+    for row in reader:
+        if not row or len(row) < 2:
+            continue
+        try:
+            wl = float(row[0])
+            rv = float(row[1])
+            if rv <= 0:
+                continue
+            wavelength.append(wl)
+            response.append(rv)
+        except ValueError:
+            # 跳過表頭或不合法列
+            continue
+
+    if len(wavelength) < 2:
+        raise ValueError("response curve 至少需要 2 個點")
+
+    wavelength = np.array(wavelength, dtype=float)
+    response = np.array(response, dtype=float)
+
+    order = np.argsort(wavelength)
+    wavelength = wavelength[order]
+    response = response[order]
+
+    return {
+        "wavelength": wavelength,
+        "response": response
+    }
+
+
+def apply_response_correction(wavelengths, intensity):
+    """
+    I_corrected = I_measured / Response(λ)
+    """
+    global response_curve_data
+
+    if response_curve_data is None:
+        return intensity, False
+
+    response_interp = interpolate_response(
+        wavelengths,
+        response_curve_data["wavelength"],
+        response_curve_data["response"]
+    )
+
+    eps = 1e-12
+    corrected = intensity / np.maximum(response_interp, eps)
+    corrected[corrected < 0] = 0
+    return corrected, True
 
 
 def detect_peaks_simple(intensity, min_distance=20, threshold_ratio=0.12):
     """
     簡單峰值偵測，不依賴 scipy
     """
+    intensity = np.asarray(intensity, dtype=float)
+
     if len(intensity) < 3:
         return np.array([], dtype=int)
 
-    threshold = np.max(intensity) * threshold_ratio
+    max_val = float(np.max(intensity))
+    if max_val <= 0:
+        return np.array([], dtype=int)
+
+    threshold = max_val * threshold_ratio
     candidates = []
 
     for i in range(1, len(intensity) - 1):
@@ -98,7 +258,7 @@ def detect_peaks_simple(intensity, min_distance=20, threshold_ratio=0.12):
     if not candidates:
         return np.array([], dtype=int)
 
-    # 合併距離太近的峰，只保留較高的
+    # 合併太近的峰，只留較高者
     filtered = []
     for idx in candidates:
         if not filtered:
@@ -113,174 +273,499 @@ def detect_peaks_simple(intensity, min_distance=20, threshold_ratio=0.12):
     return np.array(filtered, dtype=int)
 
 
-def build_calibration(pixel_peaks, known_lines):
+# =========================
+# 校正
+# =========================
+def build_calibration(pixel_peaks, known_lines, degree=None):
     """
     用峰值 pixel 與已知波長建立校正
-    2點用一次，3點以上用二次
+    預設：
+      2點 -> 一次
+      3~5點 -> 二次
+      6點以上 -> 三次（可自行限制）
     """
-    n = min(len(pixel_peaks), len(known_lines))
+    x = np.asarray(pixel_peaks, dtype=float)
+    y = np.asarray(known_lines, dtype=float)
+
+    n = min(len(x), len(y))
     if n < 2:
         raise ValueError("校正至少需要 2 個峰")
 
-    x = np.array(pixel_peaks[:n], dtype=float)
-    y = np.array(known_lines[:n], dtype=float)
+    x = x[:n]
+    y = y[:n]
 
-    degree = 1 if n < 3 else 2
+    if degree is None:
+        if n == 2:
+            degree = 1
+        elif n <= 5:
+            degree = 2
+        else:
+            degree = 3
+
+    degree = int(degree)
+    degree = max(1, min(degree, n - 1))
+
     coeffs = np.polyfit(x, y, degree)
-    return coeffs
+    fitted = np.polyval(coeffs, x)
+    rmse = float(np.sqrt(np.mean((fitted - y) ** 2)))
+
+    return coeffs, rmse
 
 
 def apply_calibration(x, coeffs):
     return np.polyval(coeffs, x)
 
 
+def parse_known_lines():
+    """
+    可從表單 known_lines 帶入自訂譜線，例如：
+    "404.656,435.833,546.074,576.960,579.066"
+    """
+    raw = request.form.get("known_lines")
+    if raw in (None, ""):
+        return MERCURY_LINES.copy()
+
+    parts = [s.strip() for s in raw.replace("\n", ",").split(",")]
+    vals = []
+    for p in parts:
+        if not p:
+            continue
+        vals.append(float(p))
+
+    if len(vals) < 2:
+        raise ValueError("known_lines 至少需要 2 個波長")
+    return np.array(vals, dtype=float)
+
+
+def select_peaks_for_calibration(peaks, intensity, known_lines_count):
+    """
+    取最亮的 N 個峰，再按 x 位置排序，
+    假設由左到右對應由短波到長波
+    """
+    if len(peaks) < 2:
+        return np.array([], dtype=int)
+
+    strengths = intensity[peaks]
+    order = np.argsort(strengths)[::-1]
+    peaks = peaks[order]
+
+    use_n = min(len(peaks), known_lines_count)
+    selected = np.sort(peaks[:use_n])
+
+    return selected
+
+
+# =========================
+# FWHM / SNR / Resolution
+# =========================
+def find_half_max_crossings(x, y, peak_idx):
+    """
+    用線性插值找半高左右交點
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    peak_val = y[peak_idx]
+    if peak_val <= 0:
+        return None, None, None
+
+    half = peak_val / 2.0
+
+    # 向左找
+    left = None
+    for i in range(peak_idx, 0, -1):
+        if y[i - 1] <= half <= y[i] or y[i - 1] >= half >= y[i]:
+            x1, x2 = x[i - 1], x[i]
+            y1, y2 = y[i - 1], y[i]
+            if y2 == y1:
+                left = x1
+            else:
+                left = x1 + (half - y1) * (x2 - x1) / (y2 - y1)
+            break
+
+    # 向右找
+    right = None
+    for i in range(peak_idx, len(y) - 1):
+        if y[i] >= half >= y[i + 1] or y[i] <= half <= y[i + 1]:
+            x1, x2 = x[i], x[i + 1]
+            y1, y2 = y[i], y[i + 1]
+            if y2 == y1:
+                right = x2
+            else:
+                right = x1 + (half - y1) * (x2 - x1) / (y2 - y1)
+            break
+
+    if left is None or right is None:
+        return half, None, None
+
+    return half, left, right
+
+
+def compute_peak_metrics(intensity, wavelengths, peak_idx):
+    """
+    對單一峰計算：
+    - FWHM (pixel)
+    - FWHM (nm)
+    - Resolution = λ / Δλ
+    """
+    x = np.arange(len(intensity), dtype=float)
+    half, left_x, right_x = find_half_max_crossings(x, intensity, peak_idx)
+
+    result = {
+        "half_max_intensity": None,
+        "fwhm_pixels": None,
+        "left_half_x": None,
+        "right_half_x": None,
+        "left_half_wavelength": None,
+        "right_half_wavelength": None,
+        "fwhm_nm": None,
+        "resolution": None
+    }
+
+    if half is None or left_x is None or right_x is None:
+        return result
+
+    left_wl = float(np.interp(left_x, x, wavelengths))
+    right_wl = float(np.interp(right_x, x, wavelengths))
+    fwhm_px = float(right_x - left_x)
+    fwhm_nm = float(right_wl - left_wl)
+    peak_wl = float(wavelengths[peak_idx])
+
+    resolution = None
+    if abs(fwhm_nm) > 1e-12:
+        resolution = abs(peak_wl / fwhm_nm)
+
+    result.update({
+        "half_max_intensity": float(half),
+        "fwhm_pixels": round(fwhm_px, 4),
+        "left_half_x": round(float(left_x), 4),
+        "right_half_x": round(float(right_x), 4),
+        "left_half_wavelength": round(left_wl, 4),
+        "right_half_wavelength": round(right_wl, 4),
+        "fwhm_nm": round(fwhm_nm, 4),
+        "resolution": round(float(resolution), 4) if resolution is not None else None
+    })
+    return result
+
+
+def estimate_noise(intensity):
+    """
+    用高頻殘差估計 noise：
+    noise ≈ std(raw - smoothed_more)
+    """
+    intensity = np.asarray(intensity, dtype=float)
+    smooth = moving_average(intensity, kernel_size=15)
+    residual = intensity - smooth
+    noise_std = float(np.std(residual))
+    return noise_std
+
+
+def compute_snr(signal_value, noise_std):
+    if noise_std <= 1e-12:
+        return None
+    return float(signal_value / noise_std)
+
+
+# =========================
+# 共用分析流程
+# =========================
+def get_dark_signal_from_request(y1, y2):
+    """
+    dark image 可選
+    """
+    dark_file = request.files.get("dark_image")
+    if dark_file is None or dark_file.filename == "":
+        return None
+
+    dark_image = decode_uploaded_image(dark_file)
+    if dark_image is None:
+        raise ValueError("dark image 讀取失敗")
+
+    dark_signal, _, _ = extract_raw_signal(dark_image, y1=y1, y2=y2)
+    return dark_signal
+
+
+def maybe_update_response_curve_from_request():
+    """
+    response_curve_file 可選
+    """
+    global response_curve_data
+    response_file = request.files.get("response_curve_file")
+    if response_file is None or response_file.filename == "":
+        return False
+
+    response_curve_data = load_response_curve_from_file(response_file)
+    return True
+
+
+def build_spectrum_payload(wavelength_all, intensity, limit_points=None):
+    data = []
+    total = len(intensity)
+
+    if limit_points is not None and total > limit_points:
+        step = max(1, total // limit_points)
+        indices = range(0, total, step)
+    else:
+        indices = range(total)
+
+    for i in indices:
+        data.append({
+            "x": int(i),
+            "wavelength": round(float(wavelength_all[i]), 4),
+            "intensity": round(float(intensity[i]), 4)
+        })
+    return data
+
+
+def analyze_spectrum_core(image, y1=None, y2=None, integration_time_ms=1.0, smooth_kernel=7):
+    """
+    核心分析流程：
+    1) 抽出 raw signal
+    2) dark correction
+    3) / integration time
+    4) wavelength calibration
+    5) response correction
+    6) peak / FWHM / SNR / resolution
+    """
+    global calibration_coeffs
+
+    if calibration_coeffs is None:
+        raise ValueError("尚未校準，請先做校準")
+
+    raw_signal, used_y1, used_y2 = extract_raw_signal(image, y1=y1, y2=y2)
+    dark_signal = get_dark_signal_from_request(used_y1, used_y2)
+
+    intensity = preprocess_intensity(
+        raw_signal,
+        dark_signal=dark_signal,
+        integration_time_ms=integration_time_ms,
+        smooth_kernel=smooth_kernel
+    )
+
+    x_all = np.arange(len(intensity), dtype=float)
+    wavelength_all = apply_calibration(x_all, calibration_coeffs)
+
+    corrected_intensity, response_applied = apply_response_correction(wavelength_all, intensity)
+
+    noise_std = estimate_noise(corrected_intensity)
+
+    peaks = detect_peaks_simple(corrected_intensity, min_distance=20, threshold_ratio=0.12)
+    peak_list = []
+
+    for p in peaks:
+        metrics = compute_peak_metrics(corrected_intensity, wavelength_all, p)
+        snr_val = compute_snr(corrected_intensity[p], noise_std)
+
+        peak_list.append({
+            "x": int(p),
+            "wavelength": round(float(wavelength_all[p]), 4),
+            "intensity": round(float(corrected_intensity[p]), 4),
+            "snr": round(float(snr_val), 4) if snr_val is not None else None,
+            **metrics
+        })
+
+    if len(corrected_intensity) == 0:
+        raise ValueError("光譜資料為空")
+
+    main_peak_x = int(np.argmax(corrected_intensity))
+    main_peak_metrics = compute_peak_metrics(corrected_intensity, wavelength_all, main_peak_x)
+    main_peak_snr = compute_snr(corrected_intensity[main_peak_x], noise_std)
+
+    spectrum_data = build_spectrum_payload(wavelength_all, corrected_intensity)
+
+    return {
+        "used_y1": int(used_y1),
+        "used_y2": int(used_y2),
+        "integration_time_ms": float(integration_time_ms),
+        "response_correction_applied": bool(response_applied),
+        "noise_std": round(float(noise_std), 4),
+        "peak_x": int(main_peak_x),
+        "peak_wavelength": round(float(wavelength_all[main_peak_x]), 4),
+        "peak_intensity": round(float(corrected_intensity[main_peak_x]), 4),
+        "peak_snr": round(float(main_peak_snr), 4) if main_peak_snr is not None else None,
+        "peak_metrics": main_peak_metrics,
+        "all_peaks": peak_list,
+        "spectrum": spectrum_data
+    }
+
+
+# =========================
+# Routes
+# =========================
 @app.route("/")
 def home():
     return render_template("index.html")
 
 
+@app.route("/set-response-curve", methods=["POST"])
+def set_response_curve():
+    global response_curve_data
+
+    try:
+        updated = maybe_update_response_curve_from_request()
+        if not updated:
+            return jsonify({"error": "沒有上傳 response_curve_file"}), 400
+
+        return jsonify({
+            "message": "response curve 載入完成",
+            "points": int(len(response_curve_data["wavelength"])),
+            "min_wavelength": float(response_curve_data["wavelength"][0]),
+            "max_wavelength": float(response_curve_data["wavelength"][-1])
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
 @app.route("/calibrate", methods=["POST"])
 def calibrate():
-    global calibration_coeffs
+    """
+    校準流程：
+    - 讀汞燈圖
+    - 自動/手動 y 範圍
+    - dark correction
+    - / integration time
+    - 自動抓峰
+    - 用 known_lines 做 polyfit
+    - 回傳係數、RMSE、峰位對應
+    """
+    global calibration_coeffs, calibration_meta
 
     if "image" not in request.files:
-        return jsonify({"error": "沒有上傳汞燈圖片"}), 400
-
-    file = request.files["image"]
-
-    y1 = request.form.get("y1")
-    y2 = request.form.get("y2")
+        return jsonify({"error": "沒有上傳校準圖片"}), 400
 
     try:
-        y1 = int(y1) if y1 not in (None, "") else None
-        y2 = int(y2) if y2 not in (None, "") else None
-    except ValueError:
-        return jsonify({"error": "y1 或 y2 格式錯誤"}), 400
+        image = decode_uploaded_image(request.files["image"])
+        if image is None:
+            return jsonify({"error": "圖片讀取失敗"}), 400
 
-    file_bytes = np.frombuffer(file.read(), np.uint8)
-    image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        y1 = parse_optional_int(request.form.get("y1"))
+        y2 = parse_optional_int(request.form.get("y2"))
+        integration_time_ms = parse_optional_float(request.form.get("integration_time_ms"), default=1.0)
+        smooth_kernel = safe_odd_kernel_size(parse_optional_int(request.form.get("smooth_kernel")) or 7)
+        degree = parse_optional_int(request.form.get("degree"))
+        known_lines = parse_known_lines()
 
-    if image is None:
-        return jsonify({"error": "圖片讀取失敗"}), 400
+        raw_signal, used_y1, used_y2 = extract_raw_signal(image, y1=y1, y2=y2)
+        dark_signal = get_dark_signal_from_request(used_y1, used_y2)
 
-    try:
-        intensity, used_y1, used_y2 = extract_spectrum(image, y1=y1, y2=y2)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        intensity = preprocess_intensity(
+            raw_signal,
+            dark_signal=dark_signal,
+            integration_time_ms=integration_time_ms,
+            smooth_kernel=smooth_kernel
+        )
 
-    peaks = detect_peaks_simple(intensity, min_distance=20, threshold_ratio=0.12)
+        peaks = detect_peaks_simple(intensity, min_distance=20, threshold_ratio=0.12)
+        if len(peaks) < 2:
+            return jsonify({"error": "偵測到的峰太少，無法校準"}), 400
 
-    if len(peaks) < 2:
-        return jsonify({"error": "偵測到的峰太少，無法校正"}), 400
+        selected_peaks = select_peaks_for_calibration(peaks, intensity, len(known_lines))
+        if len(selected_peaks) < 2:
+            return jsonify({"error": "可用峰不足，無法校準"}), 400
 
-    # 取最亮的幾個峰
-    peak_strengths = intensity[peaks]
-    sorted_idx = np.argsort(peak_strengths)[::-1]
-    peaks = peaks[sorted_idx]
+        used_lines = known_lines[:len(selected_peaks)]
+        coeffs, rmse = build_calibration(selected_peaks, used_lines, degree=degree)
+        calibration_coeffs = coeffs
 
-    use_n = min(len(peaks), len(MERCURY_LINES))
-    selected_peaks = np.sort(peaks[:use_n])
+        x_all = np.arange(len(intensity), dtype=float)
+        wavelength_all = apply_calibration(x_all, calibration_coeffs)
 
-    # 假設由左到右是短波到長波
-    known_lines = MERCURY_LINES[:use_n]
+        # 若已載入 response curve，也把校準後強度做一次響應修正供檢查
+        corrected_intensity, response_applied = apply_response_correction(wavelength_all, intensity)
 
-    try:
-        calibration_coeffs = build_calibration(selected_peaks, known_lines)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        calibrated_peak_wavelengths = apply_calibration(selected_peaks, calibration_coeffs)
 
-    x_all = np.arange(len(intensity), dtype=float)
-    wavelength_all = apply_calibration(x_all, calibration_coeffs)
+        calibration_meta = {
+            "used_y1": int(used_y1),
+            "used_y2": int(used_y2),
+            "integration_time_ms": float(integration_time_ms),
+            "degree": int(len(coeffs) - 1),
+            "rmse_nm": round(float(rmse), 6),
+            "response_correction_applied": bool(response_applied),
+            "detected_peak_pixels": [int(p) for p in selected_peaks],
+            "matched_known_lines": [float(v) for v in used_lines],
+            "calibrated_peak_wavelengths": [round(float(v), 4) for v in calibrated_peak_wavelengths]
+        }
 
-    spectrum_data = []
-    for x, wl, inten in zip(x_all, wavelength_all, intensity):
-        spectrum_data.append({
-            "x": int(x),
-            "wavelength": round(float(wl), 3),
-            "intensity": round(float(inten), 3)
+        spectrum_data = build_spectrum_payload(wavelength_all, corrected_intensity)
+
+        return jsonify({
+            "message": "校準完成",
+            "used_y1": int(used_y1),
+            "used_y2": int(used_y2),
+            "integration_time_ms": float(integration_time_ms),
+            "degree": int(len(coeffs) - 1),
+            "coefficients": [float(c) for c in calibration_coeffs],
+            "rmse_nm": round(float(rmse), 6),
+            "response_correction_applied": bool(response_applied),
+            "detected_peak_pixels": [int(p) for p in selected_peaks],
+            "matched_known_lines": [float(v) for v in used_lines],
+            "calibrated_peak_wavelengths": [round(float(v), 4) for v in calibrated_peak_wavelengths],
+            "spectrum": spectrum_data
         })
 
-    calibrated_peak_wavelengths = apply_calibration(selected_peaks, calibration_coeffs)
-
-    return jsonify({
-        "message": "校準完成",
-        "used_y1": int(used_y1),
-        "used_y2": int(used_y2),
-        "coefficients": [float(c) for c in calibration_coeffs],
-        "detected_peak_pixels": [int(p) for p in selected_peaks],
-        "matched_mercury_lines": [float(v) for v in known_lines],
-        "calibrated_peak_wavelengths": [round(float(v), 3) for v in calibrated_peak_wavelengths],
-        "spectrum": spectrum_data
-    })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
-    global calibration_coeffs
-
+    """
+    分析流程：
+    - 必須先校準
+    - 可選 dark image
+    - 可選 integration time
+    - 可選 response correction（若先上傳 response curve）
+    - 回傳 main peak / all peaks / FWHM / SNR / resolution
+    """
     if calibration_coeffs is None:
-        return jsonify({"error": "尚未校準，請先上傳汞燈圖片做校準"}), 400
+        return jsonify({"error": "尚未校準，請先上傳校準圖片做校準"}), 400
 
     if "image" not in request.files:
         return jsonify({"error": "沒有上傳圖片"}), 400
 
-    file = request.files["image"]
-
-    y1 = request.form.get("y1")
-    y2 = request.form.get("y2")
-
     try:
-        y1 = int(y1) if y1 not in (None, "") else None
-        y2 = int(y2) if y2 not in (None, "") else None
-    except ValueError:
-        return jsonify({"error": "y1 或 y2 格式錯誤"}), 400
+        image = decode_uploaded_image(request.files["image"])
+        if image is None:
+            return jsonify({"error": "圖片讀取失敗"}), 400
 
-    file_bytes = np.frombuffer(file.read(), np.uint8)
-    image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        y1 = parse_optional_int(request.form.get("y1"))
+        y2 = parse_optional_int(request.form.get("y2"))
+        integration_time_ms = parse_optional_float(request.form.get("integration_time_ms"), default=1.0)
+        smooth_kernel = safe_odd_kernel_size(parse_optional_int(request.form.get("smooth_kernel")) or 7)
 
-    if image is None:
-        return jsonify({"error": "圖片讀取失敗"}), 400
+        result = analyze_spectrum_core(
+            image,
+            y1=y1,
+            y2=y2,
+            integration_time_ms=integration_time_ms,
+            smooth_kernel=smooth_kernel
+        )
 
-    try:
-        intensity, used_y1, used_y2 = extract_spectrum(image, y1=y1, y2=y2)
-    except ValueError as e:
+        return jsonify(result)
+
+    except Exception as e:
         return jsonify({"error": str(e)}), 400
 
-    peak_x = int(np.argmax(intensity))
-    peak_intensity = float(intensity[peak_x])
-    peak_wavelength = float(apply_calibration(np.array([peak_x], dtype=float), calibration_coeffs)[0])
 
-    x_all = np.arange(len(intensity), dtype=float)
-    wavelength_all = apply_calibration(x_all, calibration_coeffs)
+@app.route("/calibration-info", methods=["GET"])
+def calibration_info():
+    global calibration_coeffs, calibration_meta
 
-    spectrum_data = []
-    for x, wl, inten in zip(x_all, wavelength_all, intensity):
-        spectrum_data.append({
-            "x": int(x),
-            "wavelength": round(float(wl), 3),
-            "intensity": round(float(inten), 3)
-        })
-
-    peaks = detect_peaks_simple(intensity, min_distance=20, threshold_ratio=0.12)
-    multi_peaks = []
-    for p in peaks:
-        multi_peaks.append({
-            "x": int(p),
-            "wavelength": round(float(apply_calibration(np.array([p], dtype=float), calibration_coeffs)[0]), 3),
-            "intensity": round(float(intensity[p]), 3)
-        })
+    if calibration_coeffs is None:
+        return jsonify({"error": "目前尚未校準"}), 400
 
     return jsonify({
-        "used_y1": int(used_y1),
-        "used_y2": int(used_y2),
-        "peak_x": peak_x,
-        "peak_wavelength": round(peak_wavelength, 3),
-        "peak_intensity": round(peak_intensity, 3),
-        "all_peaks": multi_peaks,
-        "spectrum": spectrum_data
+        "coefficients": [float(c) for c in calibration_coeffs],
+        "meta": calibration_meta
     })
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=True)
+'''
+
+out = Path('/mnt/data/upgraded_spectrometer_backend.py')
+out.write_text(code, encoding='utf-8')
+print(f"Saved to {out}")
