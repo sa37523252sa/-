@@ -1,9 +1,6 @@
-from pathlib import Path
-
-code = r'''import os
+import os
 import io
 import csv
-import json
 from flask import Flask, request, jsonify, render_template
 import cv2
 import numpy as np
@@ -57,13 +54,6 @@ def moving_average(y, kernel_size=7):
     return np.convolve(y, kernel, mode="same")
 
 
-def normalize_positive(y):
-    y = np.asarray(y, dtype=np.float64)
-    y = y - np.min(y)
-    y[y < 0] = 0
-    return y
-
-
 def interpolate_response(wavelengths, response_wl, response_val):
     """
     將 response(λ) 插值到 wavelengths
@@ -110,7 +100,7 @@ def extract_raw_signal(image, y1=None, y2=None):
     從圖片擷取一維原始訊號：
     對 ROI 灰階後，沿 y 方向加總
     """
-    height, width = image.shape[:2]
+    height, _ = image.shape[:2]
 
     if y1 is None or y2 is None:
         auto_y1, auto_y2 = auto_find_y_range(image, band_half_height=20)
@@ -764,8 +754,3 @@ def calibration_info():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=True)
-'''
-
-out = Path('/mnt/data/upgraded_spectrometer_backend.py')
-out.write_text(code, encoding='utf-8')
-print(f"Saved to {out}")
