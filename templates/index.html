@@ -52,6 +52,51 @@
 </div>
 
 <script>
+  // 在頁面載入後，自動注入拍照功能
+window.addEventListener('DOMContentLoaded', () => {
+    // 1. 建立容器
+    const container = document.createElement('div');
+    container.style.cssText = "background:#222; padding:15px; margin-bottom:20px; border-radius:8px;";
+    
+    // 2. 注入攝影機畫面與按鈕
+    container.innerHTML = `
+        <h2 style="margin-top:0;">即時擷取</h2>
+        <video id="video" width="320" height="240" autoplay playsinline style="background:#000;"></video>
+        <div style="margin:10px 0;">
+            <button id="snapBtn" style="padding:10px 20px; cursor:pointer;">📸 拍照並上傳</button>
+        </div>
+        <div id="gallery" style="display:flex; gap:10px; overflow-x:auto;"></div>
+    `;
+    document.body.prepend(container);
+
+    // 3. 綁定攝影機
+    const video = document.getElementById('video');
+    navigator.mediaDevices.getUserMedia({ video: true }).then(s => video.srcObject = s);
+
+    // 4. 拍照邏輯
+    document.getElementById('snapBtn').onclick = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        canvas.getContext('2d').drawImage(video, 0, 0);
+        
+        // 轉 Blob
+        canvas.toBlob(blob => {
+            // 自動放入歷史紀錄
+            const img = document.createElement('img');
+            img.src = canvas.toDataURL();
+            img.style.cssText = "width:80px; height:60px; cursor:pointer; border:1px solid #444;";
+            img.onclick = () => {
+                // 若點擊縮圖，將 blob 放入原有的 file input (模擬上傳)
+                const dataTransfer = new DataTransfer();
+                dataTransfer.items.add(new File([blob], "snapshot.jpg", {type: "image/jpeg"}));
+                document.getElementById("imageInput").files = dataTransfer.files;
+                alert("已將此照片載入至上傳區，請點擊原本的「分析」按鈕");
+            };
+            document.getElementById('gallery').prepend(img);
+        }, 'image/jpeg');
+    };
+});
   let chart;
   let calibrated = false;
 
