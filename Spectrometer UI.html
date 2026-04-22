@@ -1,200 +1,89 @@
 <!DOCTYPE html>
-<html lang="zh-Hant">
+<html lang="zh">
 <head>
-    <meta charset="UTF-8">
-    <title>Spectrum Studio | 極簡光譜分析</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        :root { --accent: #00f2ff; --bg: #0a0a0a; --panel: #161616; --text: #e0e0e0; }
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); margin: 0; display: flex; justify-content: center; }
-        .app-container { width: 100%; max-width: 1100px; padding: 40px 20px; }
-        
-        /* 標題與狀態 */
-        header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 30px; border-bottom: 1px solid #333; padding-bottom: 10px; }
-        h1 { font-size: 1.2rem; font-weight: 300; letter-spacing: 2px; margin: 0; text-transform: uppercase; }
-        #status { font-size: 0.8rem; color: #666; }
-
-        .main-grid { display: grid; grid-template-columns: 1fr 1.2fr; gap: 30px; }
-        
-        /* 影像與控制區 */
-        .preview-section { display: flex; flex-direction: column; gap: 15px; }
-        .video-wrap { position: relative; background: #000; border-radius: 4px; overflow: hidden; aspect-ratio: 16/9; }
-        video { width: 100%; height: 100%; object-fit: cover; }
-        
-        .input-group { display: flex; gap: 10px; align-items: center; font-size: 0.85rem; color: #888; }
-        input { background: #222; border: 1px solid #333; color: white; padding: 5px; border-radius: 3px; width: 50px; outline: none; }
-        input:focus { border-color: var(--accent); }
-
-        /* 按鈕風格 */
-        .btn-row { display: flex; gap: 10px; }
-        button { background: none; border: 1px solid #444; color: #aaa; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-size: 0.85rem; transition: 0.2s; flex: 1; }
-        button:hover { border-color: var(--accent); color: var(--accent); background: rgba(0, 242, 255, 0.05); }
-        button.primary { border-color: #ff4757; color: #ff4757; }
-        button.primary:hover { background: rgba(255, 71, 87, 0.1); }
-
-        /* 數據顯示區 */
-        .data-section { background: var(--panel); padding: 20px; border-radius: 8px; }
-        #peak-display { font-size: 1.5rem; font-weight: 200; margin-bottom: 15px; color: var(--accent); }
-        pre { font-size: 0.75rem; color: #666; background: #0f0f0f; padding: 10px; border-radius: 4px; border: 1px solid #222; }
-
-        /* 底部歷史區 */
-        .history-section { margin-top: 40px; }
-        .history-label { font-size: 0.8rem; color: #555; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 1px; }
-        #gallery { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 10px; }
-        .thumb-item { width: 140px; flex-shrink: 0; cursor: pointer; opacity: 0.6; transition: 0.3s; }
-        .thumb-item:hover { opacity: 1; }
-        .thumb-item img { width: 100%; border-radius: 2px; filter: grayscale(50%); transition: 0.3s; }
-        .thumb-item:hover img { filter: grayscale(0%); }
-    </style>
+  <meta charset="UTF-8" />
+  <title>光譜儀控制台</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: sans-serif; background: #111; color: #eee; padding: 30px; }
+    .container { max-width: 900px; margin: auto; }
+    
+    /* 相機與按鈕區域 */
+    .capture-section { display: flex; gap: 20px; align-items: flex-start; margin-bottom: 30px; }
+    video { width: 320px; height: 180px; background: #000; border-radius: 4px; }
+    button { padding: 10px 20px; background: #222; border: 1px solid #444; color: #fff; cursor: pointer; }
+    button:hover { border-color: #00f2ff; }
+    
+    /* 歷史紀錄區域 */
+    .history { display: flex; gap: 10px; overflow-x: auto; padding: 10px; background: #1a1a1a; border-radius: 4px; }
+    .history img { width: 100px; height: 60px; object-fit: cover; cursor: pointer; border: 1px solid #333; }
+  </style>
 </head>
 <body>
 
-<div class="app-container">
-    <header>
-        <h1>Spectrum Studio</h1>
-        <div id="status">INITIALIZING...</div>
-    </header>
+<div class="container">
+  <h1>光譜儀控制台</h1>
 
-    <div class="main-grid">
-        <div class="preview-section">
-            <div class="video-wrap">
-                <video id="video" autoplay playsinline></video>
-            </div>
-            <div class="input-group">
-                ROI Y-Range: 
-                <input type="number" id="y1" placeholder="Y1"> — 
-                <input type="number" id="y2" placeholder="Y2">
-                <span style="margin-left:auto" id="res-indicator">1080p Ready</span>
-            </div>
-            <div class="btn-row">
-                <button class="primary" onclick="takeSnapshot()">SNAPSHOT</button>
-                <button onclick="calibrateMercury()">CALIBRATE</button>
-                <button onclick="analyzeSpectrum()">ANALYZE</button>
-            </div>
-        </div>
-
-        <div class="data-section">
-            <div id="peak-display">-- <small>nm</small></div>
-            <canvas id="chart"></canvas>
-            <pre id="calibrationInfo">System uncalibrated.</pre>
-        </div>
+  <div class="capture-section">
+    <div>
+      <video id="video" autoplay playsinline></video>
+      <div style="margin-top:10px;">
+        <button onclick="takeAndAnalyze()">📸 拍照並分析</button>
+      </div>
     </div>
-
-    <div class="history-section">
-        <div class="history-label">Captured Archive</div>
-        <div id="gallery"></div>
+    <div style="flex-grow: 1;">
+      <p>歷史紀錄 (點擊重新分析)</p>
+      <div class="history" id="gallery"></div>
     </div>
+  </div>
+
+  <input type="number" id="y1" placeholder="y1">
+  <input type="number" id="y2" placeholder="y2">
+  <button onclick="calibrateMercury()">汞燈校準</button>
+
+  <canvas id="chart" width="800" height="300"></canvas>
+  <p id="peak">主峰波長：--</p>
+  <pre id="calibrationInfo">尚未校準</pre>
 </div>
 
 <canvas id="snapshotCanvas" style="display:none;"></canvas>
 
 <script>
-    let chart;
-    let calibrated = false;
-    const video = document.getElementById('video');
-    const canvas = document.getElementById('snapshotCanvas');
-    const gallery = document.getElementById('gallery');
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('snapshotCanvas');
+  const gallery = document.getElementById('gallery');
 
-    navigator.mediaDevices.getUserMedia({ video: { width: 1920, height: 1080 } })
-        .then(stream => { 
-            video.srcObject = stream; 
-            document.getElementById('status').innerText = "DEVICE CONNECTED"; 
-        })
-        .catch(err => { document.getElementById('status').innerText = "CAMERA ERROR"; });
+  // 1. 初始化相機
+  navigator.mediaDevices.getUserMedia({ video: true })
+    .then(stream => { video.srcObject = stream; });
 
-    function initChart(labels = [], data = []) {
-        const ctx = document.getElementById("chart").getContext("2d");
-        if (chart) chart.destroy();
-        chart = new Chart(ctx, {
-            type: "line",
-            data: {
-                labels: labels,
-                datasets: [{ 
-                    data: data, 
-                    borderColor: "#00f2ff", 
-                    borderWidth: 1.5, 
-                    fill: true,
-                    backgroundColor: "rgba(0, 242, 255, 0.05)",
-                    pointRadius: 0 
-                }]
-            },
-            options: { 
-                animation: false, 
-                responsive: true,
-                plugins: { legend: { display: false } },
-                scales: { 
-                    x: { grid: { color: "#222" }, ticks: { color: "#555", font: { size: 10 } } },
-                    y: { grid: { color: "#222" }, ticks: { color: "#555", font: { size: 10 } } }
-                }
-            }
-        });
-    }
-    initChart();
+  // 2. 拍照並上傳至 Python 後端
+  async function takeAndAnalyze() {
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0);
+    
+    // 將影像存入歷史區
+    const dataUrl = canvas.toDataURL('image/jpeg');
+    const img = document.createElement('img');
+    img.src = dataUrl;
+    img.onclick = () => alert("可在此處加入重新觸發分析的邏輯");
+    gallery.prepend(img);
 
-    function takeSnapshot() {
-        const ctx = canvas.getContext('2d');
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        ctx.drawImage(video, 0, 0);
-        const dataUrl = canvas.toDataURL('image/jpeg');
-        
-        const item = document.createElement('div');
-        item.className = 'thumb-item';
-        item.innerHTML = `<img src="${dataUrl}">`;
-        item.onclick = () => {
-            const a = document.createElement('a');
-            a.href = dataUrl;
-            a.download = `spec_${Date.now()}.jpg`;
-            a.click();
-        };
-        gallery.insertBefore(item, gallery.firstChild);
-    }
+    // 上傳至 Python
+    canvas.toBlob(async (blob) => {
+      const formData = new FormData();
+      formData.append("image", blob, "capture.jpg");
+      formData.append("y1", document.getElementById("y1").value);
+      formData.append("y2", document.getElementById("y2").value);
 
-    async function sendToBackend(endpoint) {
-        const ctx = canvas.getContext('2d');
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        ctx.drawImage(video, 0, 0);
+      const res = await fetch("/process_capture", { method: "POST", body: formData });
+      const data = await res.json();
+      updateChartFromSpectrum(data.spectrum);
+    });
+  }
 
-        return new Promise((resolve) => {
-            canvas.toBlob(async (blob) => {
-                const formData = new FormData();
-                formData.append("image", blob, "capture.jpg");
-                const y1 = document.getElementById("y1").value;
-                const y2 = document.getElementById("y2").value;
-                if (y1) formData.append("y1", y1);
-                if (y2) formData.append("y2", y2);
-
-                try {
-                    const res = await fetch(endpoint, { method: "POST", body: formData });
-                    resolve(await res.json());
-                } catch (e) { console.error("API Connection Failed"); }
-            }, 'image/jpeg');
-        });
-    }
-
-    async function calibrateMercury() {
-        const data = await sendToBackend("/calibrate");
-        if (data && !data.error) {
-            calibrated = true;
-            document.getElementById("calibrationInfo").innerText = `Calibrated: [${data.coefficients.map(c => c.toFixed(4)).join(", ")}]`;
-            updateUI(data);
-        }
-    }
-
-    async function analyzeSpectrum() {
-        if (!calibrated) return alert("Calibrate system first.");
-        const data = await sendToBackend("/analyze");
-        if (data && !data.error) updateUI(data);
-    }
-
-    function updateUI(data) {
-        initChart(data.spectrum.map(p => p.wavelength), data.spectrum.map(p => p.intensity));
-        if (data.peak_wavelength) {
-            document.getElementById("peak-display").innerHTML = `${data.peak_wavelength} <small>nm</small>`;
-        }
-    }
+  // [請保留你原本的 updateChartFromSpectrum, calibrateMercury 等函式]
 </script>
-
 </body>
 </html>
