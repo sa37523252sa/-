@@ -325,7 +325,7 @@ def parse_known_lines():
 def parse_manual_peak_pixels():
     """
     可手動指定汞燈峰值 pixel，例如：
-    peak_pixels = "123, 210, 552, 701"
+    peak_pixels = "51, 85, 150, 162"
     這會比完全自動可靠，尤其是 576/579 nm 被合併時。
     """
     raw = request.form.get("peak_pixels")
