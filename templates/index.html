@@ -4,14 +4,23 @@
   <meta charset="UTF-8" />
   <title>光譜儀 UI</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: Arial; background:#111; color:white; padding:20px; }
+    #calibrationInfo { color:#fff; background:#222; padding:10px; height:120px; overflow-y:auto; border:1px solid #444; }
+    #historyList { margin-top: 20px; border-top: 1px solid #444; padding-top: 10px; }
+    .history-item { display: block; margin: 5px; cursor: pointer; background: #333; color: white; padding: 5px; border-radius: 4px; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+  </style>
 </head>
-<body style="font-family: Arial; background:#111; color:white; padding:20px;">
+<body>
 
 <h1>光譜儀介面</h1>
 
-<div>
-  <h2>連線狀態</h2>
-  <p id="status" style="color:lime;">已連線</p>
+<div id="captureContainer" style="background:#222; padding:15px; margin-bottom:20px; border-radius:8px;">
+    <h2>即時擷取</h2>
+    <video id="video" width="320" height="240" autoplay playsinline style="background:#000;"></video>
+    <div style="margin:10px 0;"><button id="snapBtn">📸 拍照並記錄</button></div>
+    <div id="gallery" style="display:flex; gap:10px; overflow-x:auto;"></div>
 </div>
 
 <div>
@@ -20,20 +29,18 @@
 </div>
 
 <div style="margin-top: 12px;">
-  <label>y1：</label>
-  <input type="number" id="y1" placeholder="留空自動抓">
-  <label>y2：</label>
-  <input type="number" id="y2" placeholder="留空自動抓">
+  <label>y1：</label> <input type="number" id="y1" placeholder="自動抓">
+  <label>y2：</label> <input type="number" id="y2" placeholder="自動抓">
 </div>
 
 <div style="margin-top: 20px;">
-  <button onclick="calibrateMercury()">汞燈校準</button>
-  <button onclick="analyzeSpectrum()">分析圖片</button>
+  <button id="calBtn" onclick="calibrateMercury()">汞燈校準</button>
+  <button id="anaBtn" onclick="analyzeSpectrum()">分析圖片</button>
 </div>
 
 <div style="margin-top: 20px;">
   <h3>校準資訊</h3>
-  <pre id="calibrationInfo" style="color:#fff;">尚未校準</pre>
+  <pre id="calibrationInfo">尚未校準</pre>
 </div>
 
 <div style="margin-top: 20px;">
@@ -43,199 +50,112 @@
 
 <div style="margin-top: 20px;">
   <h3>分析結果</h3>
-  <p id="peak">主峰波長：-- nm ｜ 強度：--</p>
+  <p id="peak">主峰波長：-- nm</p>
 </div>
 
-<div style="margin-top: 20px;">
-  <h3>所有峰值</h3>
-  <pre id="allPeaks" style="color:#7fffd4;"></pre>
+<div id="historyList">
+    <h3>分析歷史紀錄</h3>
 </div>
 
 <script>
-  // 在頁面載入後，自動注入拍照功能
-window.addEventListener('DOMContentLoaded', () => {
-    // 1. 建立容器
-    const container = document.createElement('div');
-    container.style.cssText = "background:#222; padding:15px; margin-bottom:20px; border-radius:8px;";
+  let chart;
+  let calibrated = false;
+  let analysisHistory = []; 
+
+  // 初始化攝影機
+  window.addEventListener('DOMContentLoaded', () => {
+    navigator.mediaDevices.getUserMedia({ video: true }).then(s => document.getElementById('video').srcObject = s);
     
-    // 2. 注入攝影機畫面與按鈕
-    container.innerHTML = `
-        <h2 style="margin-top:0;">即時擷取</h2>
-        <video id="video" width="320" height="240" autoplay playsinline style="background:#000;"></video>
-        <div style="margin:10px 0;">
-            <button id="snapBtn" style="padding:10px 20px; cursor:pointer;">📸 拍照並上傳</button>
-        </div>
-        <div id="gallery" style="display:flex; gap:10px; overflow-x:auto;"></div>
-    `;
-    document.body.prepend(container);
-
-    // 3. 綁定攝影機
-    const video = document.getElementById('video');
-    navigator.mediaDevices.getUserMedia({ video: true }).then(s => video.srcObject = s);
-
-    // 4. 拍照邏輯
     document.getElementById('snapBtn').onclick = () => {
+        const video = document.getElementById('video');
         const canvas = document.createElement('canvas');
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
+        canvas.width = video.videoWidth; canvas.height = video.videoHeight;
         canvas.getContext('2d').drawImage(video, 0, 0);
         
-        // 轉 Blob
         canvas.toBlob(blob => {
-            // 自動放入歷史紀錄
             const img = document.createElement('img');
             img.src = canvas.toDataURL();
             img.style.cssText = "width:80px; height:60px; cursor:pointer; border:1px solid #444;";
+            
             img.onclick = () => {
-                // 若點擊縮圖，將 blob 放入原有的 file input (模擬上傳)
-                const dataTransfer = new DataTransfer();
-                dataTransfer.items.add(new File([blob], "snapshot.jpg", {type: "image/jpeg"}));
-                document.getElementById("imageInput").files = dataTransfer.files;
-                alert("已將此照片載入至上傳區，請點擊原本的「分析」按鈕");
+                const dt = new DataTransfer();
+                dt.items.add(new File([blob], "snapshot.jpg", {type: "image/jpeg"}));
+                document.getElementById("imageInput").files = dt.files;
+                alert("已載入截圖");
             };
             document.getElementById('gallery').prepend(img);
         }, 'image/jpeg');
     };
-});
-  let chart;
-  let calibrated = false;
+  });
 
-  function createChart(labels = [], data = []) {
+  function createChart(labels, data) {
+    if (chart) chart.destroy();
     const ctx = document.getElementById("chart").getContext("2d");
-
-    if (chart) {
-      chart.destroy();
-    }
-
     chart = new Chart(ctx, {
       type: "line",
-      data: {
-        labels: labels,
-        datasets: [{
-          label: "Intensity",
-          data: data,
-          borderColor: "cyan",
-          borderWidth: 2,
-          fill: false,
-          pointRadius: 0
-        }]
-      },
-      options: {
-        animation: false,
-        responsive: false,
-        scales: {
-          x: {
-            title: {
-              display: true,
-              text: "波長 (nm)"
-            }
-          },
-          y: {
-            title: {
-              display: true,
-              text: "強度"
-            }
-          }
-        }
-      }
+      data: { labels, datasets: [{ label: "Intensity", data, borderColor: "cyan", borderWidth: 2, fill: false, pointRadius: 0 }] },
+      options: { animation: false, responsive: false }
     });
   }
 
-  createChart();
-
-  function getFormData() {
-    const file = document.getElementById("imageInput").files[0];
-    const y1 = document.getElementById("y1").value;
-    const y2 = document.getElementById("y2").value;
-
-    if (!file) {
-      alert("請先選擇圖片");
-      return null;
+  async function callApi(endpoint, formData) {
+    const btn = endpoint === '/calibrate' ? document.getElementById('calBtn') : document.getElementById('anaBtn');
+    btn.disabled = true;
+    try {
+      const res = await fetch(endpoint, { method: "POST", body: formData });
+      return await res.json();
+    } finally {
+      btn.disabled = false;
     }
-
-    const formData = new FormData();
-    formData.append("image", file);
-
-    if (y1 !== "") formData.append("y1", y1);
-    if (y2 !== "") formData.append("y2", y2);
-
-    return formData;
-  }
-
-  function updateChartFromSpectrum(spectrum) {
-    const labels = spectrum.map(p => p.wavelength);
-    const data = spectrum.map(p => p.intensity);
-    createChart(labels, data);
   }
 
   async function calibrateMercury() {
-    const formData = getFormData();
-    if (!formData) return;
-
-    const res = await fetch("/calibrate", {
-      method: "POST",
-      body: formData
-    });
-
-    const data = await res.json();
-
-    if (data.error) {
-      alert(data.error);
-      return;
-    }
-
+    const fd = new FormData();
+    const file = document.getElementById("imageInput").files[0];
+    if (!file) return alert("請選擇圖片");
+    fd.append("image", file);
+    
+    const data = await callApi("/calibrate", fd);
+    if (data.error) return alert(data.error);
+    
     calibrated = true;
-    updateChartFromSpectrum(data.spectrum);
-
-    document.getElementById("calibrationInfo").innerText =
-`校準完成
-自動/實際使用範圍: y1=${data.used_y1}, y2=${data.used_y2}
-係數: ${data.coefficients.join(", ")}
-峰值 pixel: ${data.detected_peak_pixels.join(", ")}
-對應汞燈線: ${data.matched_mercury_lines.join(", ")}
-校正後峰值: ${data.calibrated_peak_wavelengths.join(", ")}`;
-
-    document.getElementById("peak").innerText =
-      "校準完成，可開始分析未知圖片";
-    document.getElementById("allPeaks").innerText = "";
+    createChart(data.spectrum.map(p => p.wavelength), data.spectrum.map(p => p.intensity));
+    document.getElementById("calibrationInfo").innerText = `校準成功\n係數: ${data.coefficients.join(", ")}`;
   }
 
   async function analyzeSpectrum() {
-    if (!calibrated) {
-      alert("請先做汞燈校準");
-      return;
-    }
-
-    const formData = getFormData();
-    if (!formData) return;
-
-    const res = await fetch("/analyze", {
-      method: "POST",
-      body: formData
-    });
-
-    const data = await res.json();
-
-    if (data.error) {
-      alert(data.error);
-      return;
-    }
-
-    updateChartFromSpectrum(data.spectrum);
-
-    document.getElementById("peak").innerText =
-      `主峰波長：${data.peak_wavelength} nm ｜ 強度：${data.peak_intensity} ｜ 使用範圍 y=${data.used_y1}~${data.used_y2}`;
-
-    if (data.all_peaks && data.all_peaks.length > 0) {
-      document.getElementById("allPeaks").innerText =
-        data.all_peaks.map(p =>
-          `x=${p.x}, λ=${p.wavelength} nm, intensity=${p.intensity}`
-        ).join("\n");
-    } else {
-      document.getElementById("allPeaks").innerText = "沒有偵測到其他峰值";
-    }
+    if (!calibrated) return alert("請先校準");
+    const fd = new FormData();
+    const file = document.getElementById("imageInput").files[0];
+    if (!file) return alert("請先選擇圖片");
+    fd.append("image", file);
+    
+    const data = await callApi("/analyze", fd);
+    if (data.error) return alert(data.error);
+    
+    // 更新圖表與顯示
+    createChart(data.spectrum.map(p => p.wavelength), data.spectrum.map(p => p.intensity));
+    document.getElementById("peak").innerText = `主峰波長：${data.peak_wavelength} nm`;
+    
+    // 將結果存入歷史陣列
+    const record = {
+        time: new Date().toLocaleTimeString(),
+        result: data.peak_wavelength,
+        spectrum: data.spectrum
+    };
+    analysisHistory.push(record);
+    
+    // 更新 UI 列表
+    const listDiv = document.getElementById("historyList");
+    const btn = document.createElement("button");
+    btn.className = "history-item";
+    btn.innerText = `紀錄 ${analysisHistory.length}: ${record.result} nm (${record.time})`;
+    btn.onclick = () => {
+        createChart(record.spectrum.map(p => p.wavelength), record.spectrum.map(p => p.intensity));
+        document.getElementById("peak").innerText = `回看結果：${record.result} nm`;
+    };
+    listDiv.appendChild(btn);
   }
 </script>
-
 </body>
 </html>
