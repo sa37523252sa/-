@@ -1,6 +1,7 @@
 import os
 import io
 import csv
+import itertools
 from flask import Flask, request, jsonify, render_template
 import cv2
 import numpy as np
@@ -268,11 +269,9 @@ def detect_peaks_simple(intensity, min_distance=20, threshold_ratio=0.12):
 # =========================
 def build_calibration(pixel_peaks, known_lines, degree=None):
     """
-    用峰值 pixel 與已知波長建立校正
-    預設：
-      2點 -> 一次
-      3~5點 -> 二次
-      6點以上 -> 三次（可自行限制）
+    用峰值 pixel 與已知波長建立校正。
+    初版預設使用一次式 lambda = a * pixel + b，避免二次式把錯誤峰值放大。
+    若確定儀器有明顯非線性，再在表單傳 degree=2。
     """
     x = np.asarray(pixel_peaks, dtype=float)
     y = np.asarray(known_lines, dtype=float)
@@ -284,13 +283,9 @@ def build_calibration(pixel_peaks, known_lines, degree=None):
     x = x[:n]
     y = y[:n]
 
+    # 重要修改：預設改成一次校正，比較穩
     if degree is None:
-        if n == 2:
-            degree = 1
-        elif n <= 5:
-            degree = 2
-        else:
-            degree = 3
+        degree = 1
 
     degree = int(degree)
     degree = max(1, min(degree, n - 1))
@@ -327,22 +322,96 @@ def parse_known_lines():
     return np.array(vals, dtype=float)
 
 
-def select_peaks_for_calibration(peaks, intensity, known_lines_count):
+def parse_manual_peak_pixels():
     """
-    取最亮的 N 個峰，再按 x 位置排序，
-    假設由左到右對應由短波到長波
+    可手動指定汞燈峰值 pixel，例如：
+    peak_pixels = "123, 210, 552, 701"
+    這會比完全自動可靠，尤其是 576/579 nm 被合併時。
+    """
+    raw = request.form.get("peak_pixels")
+    if raw in (None, ""):
+        return None
+
+    vals = []
+    for p in raw.replace("\n", ",").split(","):
+        p = p.strip()
+        if not p:
+            continue
+        vals.append(int(round(float(p))))
+
+    if len(vals) < 2:
+        raise ValueError("peak_pixels 至少需要 2 個 pixel 位置")
+    return np.array(sorted(vals), dtype=int)
+
+
+def select_peaks_for_calibration(peaks, intensity, known_lines_count, max_candidates=12):
+    """
+    舊版只是取最亮 N 個峰，容易把 576/579 nm 或雜訊峰配錯。
+    這裡只先挑出候選峰：取較亮的 max_candidates 個，再依 pixel 排序。
+    真正對應已知汞燈線會交給 match_calibration_peaks()。
     """
     if len(peaks) < 2:
         return np.array([], dtype=int)
 
     strengths = intensity[peaks]
     order = np.argsort(strengths)[::-1]
-    peaks = peaks[order]
+    use_n = min(len(peaks), max(max_candidates, known_lines_count))
+    candidates = np.sort(peaks[order[:use_n]])
+    return candidates.astype(int)
 
-    use_n = min(len(peaks), known_lines_count)
-    selected = np.sort(peaks[:use_n])
 
-    return selected
+def match_calibration_peaks(candidate_peaks, intensity, known_lines, degree=None):
+    """
+    自動配對汞燈峰：
+    - 從候選 peak 中選出一組
+    - 可跳過沒有抓到的汞燈線，例如 576/579 nm 太近被合併
+    - 用 RMSE 小且使用點數多者作為校正
+
+    回傳：selected_peaks, used_lines, coeffs, rmse, method
+    """
+    candidate_peaks = np.asarray(candidate_peaks, dtype=int)
+    known_lines = np.asarray(known_lines, dtype=float)
+
+    if len(candidate_peaks) < 2:
+        raise ValueError("候選峰太少，無法校準")
+
+    best = None
+    max_k = min(len(candidate_peaks), len(known_lines))
+
+    for k in range(max_k, 1, -1):
+        peak_combos = list(itertools.combinations(candidate_peaks, k))
+        line_combos = list(itertools.combinations(known_lines, k))
+
+        for px_tuple in peak_combos:
+            px = np.array(px_tuple, dtype=float)
+
+            for wl_tuple in line_combos:
+                wl = np.array(wl_tuple, dtype=float)
+                try:
+                    coeffs, rmse = build_calibration(px, wl, degree=degree)
+                except Exception:
+                    continue
+
+                # 檢查校正後波長是否隨 pixel 增加而增加
+                test_x = np.linspace(px.min(), px.max(), 20)
+                test_wl = apply_calibration(test_x, coeffs)
+                if np.any(np.diff(test_wl) <= 0):
+                    continue
+
+                # RMSE 為主，同時獎勵使用較多校正點，避免只用 2 點 RMSE=0 卻不可靠
+                score = rmse - 0.25 * k
+                if best is None or score < best[0]:
+                    best = (score, px.astype(int), wl, coeffs, rmse, k)
+
+        if best is not None and best[5] >= 3 and best[4] <= 3.0:
+            break
+
+    if best is None:
+        raise ValueError("無法自動配對汞燈峰，請改用 peak_pixels 手動指定峰位置")
+
+    _, selected_peaks, used_lines, coeffs, rmse, k = best
+    method = f"auto_match_{k}_points"
+    return selected_peaks, used_lines, coeffs, rmse, method
 
 
 # =========================
@@ -615,8 +684,8 @@ def calibrate():
     - dark correction
     - / integration time
     - 自動抓峰
-    - 用 known_lines 做 polyfit
-    - 回傳係數、RMSE、峰位對應
+    - 自動配對汞燈已知譜線，或用手動 peak_pixels 指定
+    - 建立 pixel -> wavelength 校正
     """
     global calibration_coeffs, calibration_meta
 
@@ -632,8 +701,9 @@ def calibrate():
         y2 = parse_optional_int(request.form.get("y2"))
         integration_time_ms = parse_optional_float(request.form.get("integration_time_ms"), default=1.0)
         smooth_kernel = safe_odd_kernel_size(parse_optional_int(request.form.get("smooth_kernel")) or 7)
-        degree = parse_optional_int(request.form.get("degree"))
+        degree = parse_optional_int(request.form.get("degree"))  # 不填時預設 degree=1
         known_lines = parse_known_lines()
+        manual_peak_pixels = parse_manual_peak_pixels()
 
         raw_signal, used_y1, used_y2 = extract_raw_signal(image, y1=y1, y2=y2)
         dark_signal = get_dark_signal_from_request(used_y1, used_y2)
@@ -646,33 +716,43 @@ def calibrate():
         )
 
         peaks = detect_peaks_simple(intensity, min_distance=20, threshold_ratio=0.12)
-        if len(peaks) < 2:
-            return jsonify({"error": "偵測到的峰太少，無法校準"}), 400
+        if len(peaks) < 2 and manual_peak_pixels is None:
+            return jsonify({"error": "偵測到的峰太少，無法校準；請手動輸入 peak_pixels"}), 400
 
-        selected_peaks = select_peaks_for_calibration(peaks, intensity, len(known_lines))
-        if len(selected_peaks) < 2:
-            return jsonify({"error": "可用峰不足，無法校準"}), 400
+        if manual_peak_pixels is not None:
+            selected_peaks = manual_peak_pixels
+            used_lines = known_lines[:len(selected_peaks)]
+            coeffs, rmse = build_calibration(selected_peaks, used_lines, degree=degree)
+            calibration_method = "manual_peak_pixels"
+            candidate_peaks = selected_peaks
+        else:
+            candidate_peaks = select_peaks_for_calibration(peaks, intensity, len(known_lines), max_candidates=12)
+            selected_peaks, used_lines, coeffs, rmse, calibration_method = match_calibration_peaks(
+                candidate_peaks,
+                intensity,
+                known_lines,
+                degree=degree
+            )
 
-        used_lines = known_lines[:len(selected_peaks)]
-        coeffs, rmse = build_calibration(selected_peaks, used_lines, degree=degree)
         calibration_coeffs = coeffs
 
         x_all = np.arange(len(intensity), dtype=float)
         wavelength_all = apply_calibration(x_all, calibration_coeffs)
 
-        # 若已載入 response curve，也把校準後強度做一次響應修正供檢查
         corrected_intensity, response_applied = apply_response_correction(wavelength_all, intensity)
-
         calibrated_peak_wavelengths = apply_calibration(selected_peaks, calibration_coeffs)
 
         calibration_meta = {
+            "calibration_method": calibration_method,
             "used_y1": int(used_y1),
             "used_y2": int(used_y2),
             "integration_time_ms": float(integration_time_ms),
             "degree": int(len(coeffs) - 1),
             "rmse_nm": round(float(rmse), 6),
             "response_correction_applied": bool(response_applied),
-            "detected_peak_pixels": [int(p) for p in selected_peaks],
+            "all_detected_peak_pixels": [int(p) for p in peaks],
+            "candidate_peak_pixels": [int(p) for p in candidate_peaks],
+            "selected_peak_pixels": [int(p) for p in selected_peaks],
             "matched_known_lines": [float(v) for v in used_lines],
             "calibrated_peak_wavelengths": [round(float(v), 4) for v in calibrated_peak_wavelengths]
         }
@@ -681,6 +761,7 @@ def calibrate():
 
         return jsonify({
             "message": "校準完成",
+            "calibration_method": calibration_method,
             "used_y1": int(used_y1),
             "used_y2": int(used_y2),
             "integration_time_ms": float(integration_time_ms),
@@ -688,7 +769,9 @@ def calibrate():
             "coefficients": [float(c) for c in calibration_coeffs],
             "rmse_nm": round(float(rmse), 6),
             "response_correction_applied": bool(response_applied),
-            "detected_peak_pixels": [int(p) for p in selected_peaks],
+            "all_detected_peak_pixels": [int(p) for p in peaks],
+            "candidate_peak_pixels": [int(p) for p in candidate_peaks],
+            "selected_peak_pixels": [int(p) for p in selected_peaks],
             "matched_known_lines": [float(v) for v in used_lines],
             "calibrated_peak_wavelengths": [round(float(v), 4) for v in calibrated_peak_wavelengths],
             "spectrum": spectrum_data
