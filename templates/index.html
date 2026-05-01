@@ -306,7 +306,9 @@
   }
 
   async function callApi(endpoint, formData) {
-    const btn = endpoint === '/calibrate' ? document.getElementById('calBtn') : document.getElementById('anaBtn');
+   const btn = endpoint.includes('calibrate') 
+  ? document.getElementById('calBtn') 
+  : document.getElementById('anaBtn');
     btn.disabled = true;
     try {
       const res = await fetch(endpoint, { method: "POST", body: formData });
