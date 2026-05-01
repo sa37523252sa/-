@@ -322,7 +322,7 @@
     if (!file) return alert("請選擇圖片");
     fd.append("image", file);
 
-    const data = await callApi("/calibrate", fd);
+    const data = await callApi("/calibrate-imagej", fd);
     if (data.error) return alert(data.error);
 
     calibrated = true;
