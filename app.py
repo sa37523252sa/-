@@ -648,6 +648,119 @@ def analyze_spectrum_core(image, y1=None, y2=None, integration_time_ms=1.0, smoo
     }
 
 
+
+
+# =========================
+# ImageJ Values.csv 校正工具
+# =========================
+def read_imagej_values_from_file(file_storage):
+    """
+    讀取 ImageJ 匯出的 Values.csv。
+    常見格式：Distance_(pixels), Gray_Value
+    也支援任意至少兩欄的 CSV，預設取前兩欄。
+    """
+    content = file_storage.read().decode("utf-8-sig")
+    reader = csv.reader(io.StringIO(content))
+
+    x_vals = []
+    y_vals = []
+
+    for row in reader:
+        if not row or len(row) < 2:
+            continue
+        try:
+            x = float(row[0])
+            y = float(row[1])
+        except ValueError:
+            # 跳過表頭，例如 Distance_(pixels), Gray_Value
+            continue
+        if np.isfinite(x) and np.isfinite(y):
+            x_vals.append(x)
+            y_vals.append(y)
+
+    if len(x_vals) < 5:
+        raise ValueError("ImageJ CSV 有效資料點太少，請確認至少有兩欄：Distance_(pixels), Gray_Value")
+
+    return np.array(x_vals, dtype=float), np.array(y_vals, dtype=float)
+
+
+def preprocess_imagej_intensity(gray_values, smooth_kernel=3, baseline_percentile=5):
+    """
+    ImageJ Gray_Value 前處理：
+    1) 用低百分位背景扣除，避免整條背景墊高
+    2) 負值歸零
+    3) 輕微平滑；建議 smooth_kernel=1 或 3，太大會移動峰位
+    """
+    y = np.asarray(gray_values, dtype=float)
+
+    baseline_percentile = float(baseline_percentile)
+    baseline_percentile = max(0.0, min(50.0, baseline_percentile))
+    baseline = np.percentile(y, baseline_percentile)
+
+    y = y - baseline
+    y[y < 0] = 0
+
+    if smooth_kernel is not None and int(smooth_kernel) > 1:
+        y = moving_average(y, kernel_size=smooth_kernel)
+
+    return y
+
+
+def detect_peaks_from_xy(x, intensity, min_distance=8, threshold_ratio=0.08):
+    """
+    給 ImageJ x/y 用的簡單峰值偵測。
+    回傳的是 index；實際 peak pixel 用 x[index]。
+    """
+    x = np.asarray(x, dtype=float)
+    intensity = np.asarray(intensity, dtype=float)
+
+    if len(intensity) < 3 or np.max(intensity) <= 0:
+        return np.array([], dtype=int)
+
+    threshold = float(np.max(intensity)) * float(threshold_ratio)
+    candidates = []
+
+    for i in range(1, len(intensity) - 1):
+        if intensity[i] > intensity[i - 1] and intensity[i] >= intensity[i + 1] and intensity[i] >= threshold:
+            candidates.append(i)
+
+    if not candidates:
+        return np.array([], dtype=int)
+
+    filtered = []
+    for idx in candidates:
+        if not filtered:
+            filtered.append(idx)
+            continue
+
+        if x[idx] - x[filtered[-1]] < float(min_distance):
+            if intensity[idx] > intensity[filtered[-1]]:
+                filtered[-1] = idx
+        else:
+            filtered.append(idx)
+
+    return np.array(filtered, dtype=int)
+
+
+def build_spectrum_payload_from_xy(x_values, wavelength_all, intensity, limit_points=None):
+    data = []
+    total = len(intensity)
+
+    if limit_points is not None and total > limit_points:
+        step = max(1, total // limit_points)
+        indices = range(0, total, step)
+    else:
+        indices = range(total)
+
+    for i in indices:
+        data.append({
+            "x": round(float(x_values[i]), 4),
+            "wavelength": round(float(wavelength_all[i]), 4),
+            "intensity": round(float(intensity[i]), 4)
+        })
+    return data
+
+
 # =========================
 # Routes
 # =========================
@@ -780,6 +893,110 @@ def calibrate():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
+
+
+@app.route("/calibrate-imagej", methods=["POST"])
+def calibrate_imagej():
+    """
+    用 ImageJ 匯出的 Values.csv 進行汞燈校正。
+
+    表單欄位：
+    - imagej_csv 或 csv_file 或 values_csv：ImageJ Values.csv
+    - peak_pixels：手動汞燈峰 pixel，例如 51,85,150,161
+    - known_lines：對應波長，例如 404.656,435.833,546.074,579.066
+    - degree：預設 2；若校正後明顯彎曲過頭，可改 1
+    - smooth_kernel：預設 3；太大會讓峰位偏移
+    - baseline_percentile：預設 5
+    """
+    global calibration_coeffs, calibration_meta
+
+    csv_file = (
+        request.files.get("imagej_csv")
+        or request.files.get("csv_file")
+        or request.files.get("values_csv")
+        or request.files.get("file")
+    )
+
+    if csv_file is None or csv_file.filename == "":
+        return jsonify({"error": "沒有上傳 ImageJ Values.csv，欄位名稱可用 imagej_csv / csv_file / values_csv / file"}), 400
+
+    try:
+        x_values, raw_gray = read_imagej_values_from_file(csv_file)
+
+        smooth_kernel = safe_odd_kernel_size(parse_optional_int(request.form.get("smooth_kernel")) or 3)
+        baseline_percentile = parse_optional_float(request.form.get("baseline_percentile"), default=5)
+        threshold_ratio = parse_optional_float(request.form.get("threshold_ratio"), default=0.08)
+        min_distance = parse_optional_float(request.form.get("min_distance"), default=8)
+        degree = parse_optional_int(request.form.get("degree"))
+        if degree is None:
+            degree = 2
+
+        known_lines = parse_known_lines()
+        manual_peak_pixels = parse_manual_peak_pixels()
+        if manual_peak_pixels is None:
+            # 給你的 ImageJ CSV 預設值；之後不同圖片請在前端/表單改 peak_pixels
+            manual_peak_pixels = np.array([51, 85, 150, 161], dtype=int)
+
+        if len(manual_peak_pixels) != len(known_lines):
+            # 常見狀況：known_lines 預設有 5 條，但 577/579 通常解析不開，所以只取前 N 條會錯。
+            # 若使用預設汞燈線且手動峰為 4 個，改用 404/435/546/579 這四條。
+            default_four = np.array([404.656, 435.833, 546.074, 579.066], dtype=float)
+            if len(manual_peak_pixels) == 4 and len(known_lines) == 5:
+                known_lines = default_four
+            else:
+                return jsonify({
+                    "error": "peak_pixels 數量必須等於 known_lines 數量。若 577/579 分不開，請用 known_lines=404.656,435.833,546.074,579.066"
+                }), 400
+
+        intensity = preprocess_imagej_intensity(
+            raw_gray,
+            smooth_kernel=smooth_kernel,
+            baseline_percentile=baseline_percentile
+        )
+
+        coeffs, rmse = build_calibration(manual_peak_pixels, known_lines, degree=degree)
+        calibration_coeffs = coeffs
+
+        wavelength_all = apply_calibration(x_values, calibration_coeffs)
+        calibrated_peak_wavelengths = apply_calibration(manual_peak_pixels, calibration_coeffs)
+        detected_idx = detect_peaks_from_xy(
+            x_values,
+            intensity,
+            min_distance=min_distance,
+            threshold_ratio=threshold_ratio
+        )
+        detected_peak_pixels = x_values[detected_idx]
+
+        calibration_meta = {
+            "calibration_method": "imagej_values_csv_manual_peak_pixels",
+            "degree": int(len(coeffs) - 1),
+            "rmse_nm": round(float(rmse), 6),
+            "manual_peak_pixels": [float(v) for v in manual_peak_pixels],
+            "matched_known_lines": [float(v) for v in known_lines],
+            "calibrated_peak_wavelengths": [round(float(v), 4) for v in calibrated_peak_wavelengths],
+            "detected_peak_pixels_for_reference": [round(float(v), 4) for v in detected_peak_pixels],
+            "smooth_kernel": int(smooth_kernel),
+            "baseline_percentile": float(baseline_percentile),
+            "note": "此校正來自 ImageJ Values.csv。分析圖片時請確保像素 x 座標與 ImageJ 匯出的方向、裁切範圍一致。"
+        }
+
+        spectrum_data = build_spectrum_payload_from_xy(x_values, wavelength_all, intensity)
+
+        return jsonify({
+            "message": "ImageJ CSV 校準完成",
+            "calibration_method": calibration_meta["calibration_method"],
+            "degree": calibration_meta["degree"],
+            "coefficients": [float(c) for c in calibration_coeffs],
+            "rmse_nm": calibration_meta["rmse_nm"],
+            "manual_peak_pixels": calibration_meta["manual_peak_pixels"],
+            "matched_known_lines": calibration_meta["matched_known_lines"],
+            "calibrated_peak_wavelengths": calibration_meta["calibrated_peak_wavelengths"],
+            "detected_peak_pixels_for_reference": calibration_meta["detected_peak_pixels_for_reference"],
+            "spectrum": spectrum_data
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
