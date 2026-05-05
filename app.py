@@ -909,7 +909,7 @@ def calibrate():
         else:
             # A 方案：直接上傳圖片也能校正。
             # 使用你這組固定裝置/裁切得到的汞燈 peak pixel，避免自動配對把 546 nm 拉到 580 nm。
-            selected_peaks = np.array([51, 85, 150, 161], dtype=int)
+            selected_peaks = np.array([69, 123, 337, 395], dtype=int)
             used_lines = np.array([404.656, 435.833, 546.074, 579.066], dtype=float)
             normalized_positions = pixels_to_normalized_positions(selected_peaks, len(intensity))
             calibration_coeffs = {
