@@ -1026,7 +1026,7 @@ def calibrate_imagej():
         manual_peak_pixels = parse_manual_peak_pixels()
         if manual_peak_pixels is None:
             # 給你的 ImageJ CSV 預設值；之後不同圖片請在前端/表單改 peak_pixels
-            manual_peak_pixels = np.array([51, 85, 150, 161], dtype=int)
+            manual_peak_pixels = np.array([69, 123, 337, 395], dtype=int)
 
         if len(manual_peak_pixels) != len(known_lines):
             # 常見狀況：known_lines 預設有 5 條，但 577/579 通常解析不開，所以只取前 N 條會錯。
